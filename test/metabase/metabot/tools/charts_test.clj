@@ -4,6 +4,7 @@
    branches on a capability."
   (:require
    [clojure.test :refer :all]
+   [metabase.lib.convert :as lib.convert]
    [metabase.lib.core :as lib]
    [metabase.lib.metadata :as lib.metadata]
    [metabase.lib.test-metadata :as meta]
@@ -13,6 +14,29 @@
    [metabase.metabot.tools.shared :as shared]
    [metabase.test :as mt]
    [metabase.util.json :as json]))
+
+(deftest ^:parallel generated-chart-temporal-filter-test
+  (testing "the generated visualization retains both predicates after JSON serialization (#79629)"
+    (let [query (lib/normalize
+                 {:lib/type :mbql/query
+                  :database 1
+                  :stages [{:lib/type :mbql.stage/mbql
+                            :source-card 1
+                            :aggregation [[:count {}]]
+                            :filters [[:and {}
+                                       [:= {} [:field {:base-type :type/Boolean} "is_included"] true]
+                                       [:during {} [:field {:base-type :type/Date} "probe_date"]
+                                        "2026-07-01" :month]]]}]})
+          result (binding [shared/*memory-atom* (atom {:state {:queries {"q-1" query}}})
+                           shared/*profile-id* :nlq]
+                   (charts/create-chart-tool {:data_source {:query_id "q-1"}
+                                              :viz_settings {:chart_type "scalar"}
+                                              :title "Included rows in July"
+                                              :description "Included rows during July 2026."}))
+          decoded (-> (get-in result [:data-parts 0 :data :query :query])
+                      json/encode json/decode+kw lib.convert/js-legacy-query->mbql5)]
+      (is (= (:query (lib/->legacy-MBQL query))
+             (:query (lib/->legacy-MBQL decoded)))))))
 
 ;; create-chart only needs the query present in queries-state; the link builder
 ;; json-encodes it and `->frontend-query` passes a non-MBQL 5 value through unchanged,
