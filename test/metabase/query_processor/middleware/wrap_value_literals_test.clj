@@ -92,6 +92,22 @@
            (parse-with-timezone "2018-10-01" timezone))
         (format "datetime literal string '2018-10-01' parsed with the %s timezone should be %s" timezone expected))))
 
+(deftest ^:parallel parse-prewrapped-absolute-datetime-strings-test
+  (testing "JSON temporal payloads are parsed without changing their clause unit or options"
+    (doseq [[literal temporal] [["2026" (t/local-date "2026-01-01")]
+                                ["2026-07" (t/local-date "2026-07-01")]
+                                ["2026-07-01" (t/local-date "2026-07-01")]
+                                ["2026-07-01T12:34:56" (t/local-date-time "2026-07-01T12:34:56")]
+                                ["2026-07-01T12:34:56+02:00" (t/offset-date-time "2026-07-01T12:34:56+02:00")]]]
+      (is (= [:absolute-datetime {:lib/uuid "stable"} temporal :day]
+             (#'qp.wrap-value-literals/wrap-value-literals-in-clause
+              nil nil [:absolute-datetime {:lib/uuid "stable"} literal :day])))))
+  (testing "already parsed temporal values and unrelated strings are not coerced"
+    (is (nil? (#'qp.wrap-value-literals/wrap-value-literals-in-clause
+               nil nil [:absolute-datetime {} (t/local-date "2026-07-01") :day])))
+    (is (nil? (#'qp.wrap-value-literals/wrap-value-literals-in-clause
+               nil nil [:value {} "2026-07-01"])))))
+
 (deftest ^:parallel wrap-datetime-literal-strings-test
   (is (= (:query
           (lib.tu.macros/mbql-query checkins

@@ -223,6 +223,11 @@
 (defn- wrap-value-literals-in-clause
   [query path clause]
   (match/match-one clause
+    ;; JSON-backed queries retain the :absolute-datetime wrapper, but serialize its temporal value as a string.
+    ;; Parse it before temporal-filter optimization, which operates on java.time values.
+    [:absolute-datetime opts (s :guard string?) unit]
+    [:absolute-datetime opts (u.date/parse s) unit]
+
     ;; two literals
     [(tag :guard #{:= :!= :< :> :<= :>=}) opts (x :guard raw-value?) (y :guard raw-value?)]
     (let [x-type (lib.schema.expression/type-of-resolved x)

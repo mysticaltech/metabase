@@ -91,6 +91,35 @@
 
 ;;; resolve-metabase-uri tests
 
+(deftest json-absolute-date-native-source-execution-test
+  (testing "JSON absolute dates execute after a Metabot saved-source handoff"
+    #_{:clj-kondo/ignore [:metabase/disallow-hardcoded-driver-names-in-tests]}
+    (mt/test-drivers #{:h2}
+      (let [sql (str/join " UNION ALL "
+                          (for [date ["2026-06-30" "2026-07-01" "2026-07-31" "2026-08-01"]]
+                            (str "SELECT DATE '" date "' AS \"probe_date\", TRUE AS \"is_included\"")))]
+        (mt/with-temp [:model/Card source {:dataset_query (mt/native-query {:query sql})}]
+          (let [query (lib/normalize
+                       {:lib/type :mbql/query
+                        :database (mt/id)
+                        :stages [{:lib/type :mbql.stage/mbql
+                                  :source-card (:id source)
+                                  :aggregation [[:count {}]]
+                                  :filters [[:and {}
+                                             [:= {} [:field {:base-type :type/Boolean} "is_included"] true]
+                                             [:between {}
+                                              [:field {:base-type :type/Date} "probe_date"]
+                                              [:absolute-datetime {} "2026-07-01" :day]
+                                              [:absolute-datetime {} "2026-07-31" :day]]]]}]})
+                decoded (:dataset_query (decode-question-url (links/query-and-viz-link query :scalar)))
+                reopened (lib.convert/js-legacy-query->mbql5 decoded)]
+            (is (= [[2]] (mt/rows (mt/process-query query))))
+            (is (= [[2]] (mt/rows (mt/process-query decoded))))
+            (is (= [[2]] (mt/rows (mt/process-query reopened))))
+            (mt/with-temp [:model/Card saved {:dataset_query reopened}]
+              (is (= [[2]] (mt/rows (mt/process-query
+                                    (t2/select-one-fn :dataset_query :model/Card :id (:id saved)))))))))))))
+
 (deftest ^:parallel resolve-metabase-uri-query-links-test
   (testing "resolves query links"
     (let [query-id      "abc-123"
