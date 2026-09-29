@@ -221,7 +221,8 @@
 (def ^:private supported-models
   "OpenAI chat models offered in the Metabot model picker, as a map of model id -> display name.
   `list-models` returns the intersection of this map with the account's `/v1/models` catalog."
-  {"gpt-5.6-sol"   "GPT-5.6 Sol"
+  {"gpt-6-sol"     "GPT-6 Sol"
+   "gpt-5.6-sol"   "GPT-5.6 Sol"
    "gpt-5.6-terra" "GPT-5.6 Terra"
    "gpt-5.6-luna"  "GPT-5.6 Luna"
    "gpt-5.5"       "GPT-5.5"
@@ -271,10 +272,12 @@
 (defn- model-supports-temperature?
   "Whether `model` accepts an explicit `temperature` parameter.
 
-  The GPT-5 family and the o-series reasoning models only support the default temperature."
+  The GPT-5 and GPT-6 families and the o-series reasoning models only support the default temperature
+  when using their default reasoning effort."
   [model]
   (let [model (str/replace-first (str model) #"^openai\." "")]
     (not (or (str/starts-with? model "gpt-5")
+             (str/starts-with? model "gpt-6")
              (re-find #"^o\d" model)))))
 
 (mu/defn openai-request-body
