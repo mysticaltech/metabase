@@ -3,6 +3,7 @@
    #?@(:cljs ([metabase.test-runner.assert-exprs.approximately-equal]))
    [clojure.test :refer [are deftest is testing]]
    [medley.core :as m]
+   [metabase.lib.convert :as lib.convert]
    [metabase.lib.core :as lib]
    [metabase.lib.expression :as lib.expression]
    [metabase.lib.field.util :as lib.field.util]
@@ -605,6 +606,18 @@
   (let [created-at (meta/field-metadata :products :created-at)]
     (check-display-names
      [{:clause [:= created-at "2023-10-03"], :name "Created At is on Oct 3, 2023"}
+      {:clause [:= created-at (lib/absolute-datetime "2026-07-01" :day)],
+       :name "Created At is Jul 1, 2026"}
+      {:clause [:= created-at (lib/absolute-datetime "2026-07-01" :month)],
+       :name "Created At is Jul 1–31, 2026"}
+      {:clause [:= created-at (lib/absolute-datetime "2026-07-01T12:34:00" :default)],
+       :name "Created At is Jul 1, 2026, 12:34 PM"}
+      {:clause [:= created-at (lib/absolute-datetime :current :day)],
+       :name "Created At is today"}
+      {:clause [:between created-at
+                (lib/absolute-datetime "2026-07-01" :day)
+                (lib/absolute-datetime "2026-07-31" :day)],
+       :name "Created At is between Jul 1, 2026 and Jul 31, 2026"}
       {:clause [:= created-at "2023-10-03T12:30:00"],
        :name "Created At is on Oct 3, 2023, 12:30 PM"}
       {:clause [:> created-at "2023-10-03"], :name "Created At is after Oct 3, 2023"}
@@ -636,6 +649,21 @@
                 "2023-08-27T00:00:00-06:00"
                 "2023-11-27T00:00:00-06:00"],
        :name "Created At is Aug 27, 12:00 AM – Nov 27, 2023, 12:00 AM"}])))
+
+(deftest ^:parallel json-legacy-absolute-date-display-name-test
+  (let [legacy-query {:database (meta/id)
+                      :type "query"
+                      :query {:source-table (meta/id :products)
+                              :filter ["between"
+                                       ["field" (meta/id :products :created-at) nil]
+                                       ["absolute-datetime" "2026-07-01" "day"]
+                                       ["absolute-datetime" "2026-07-31" "day"]]}}
+        query        (lib/query meta/metadata-provider
+                                (lib.convert/js-legacy-query->mbql5
+                                 #?(:clj legacy-query :cljs (clj->js legacy-query))))
+        [date-filter] (lib/filters query)]
+    (is (= "Created At is between Jul 1, 2026 and Jul 31, 2026"
+           (lib/display-name query 0 date-filter)))))
 
 (deftest ^:parallel filter-positions-test
   (let [base (-> (lib/query meta/metadata-provider (meta/table-metadata :orders))
