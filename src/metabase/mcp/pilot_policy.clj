@@ -7,7 +7,7 @@
    (java.net URI)
    (java.nio.charset StandardCharsets)
    (java.security MessageDigest)
-   (java.time LocalDate OffsetDateTime)))
+   (java.time LocalDate OffsetDateTime ZoneOffset)))
 
 (set! *warn-on-reflection* true)
 
@@ -123,13 +123,23 @@
         (some #(when (= (:id %) (:id arguments)) %) (:reports policy)))
       (unavailable!)))
 
+(defn- canonical-date [value]
+  (when (and (string? value) (<= (count value) 35))
+    (try
+      (if-let [[_ day offset] (re-matches #"([0-9]{4}-[0-9]{2}-[0-9]{2})T00:00:00(?:\.0{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})?" value)]
+        (let [date (LocalDate/parse day)]
+          ;; DATE values name a reporting day; validate the offset without applying it.
+          (when offset (ZoneOffset/of offset))
+          (when (= day (str date)) day))
+        (when (= value (str (LocalDate/parse value))) value))
+      (catch Exception _ nil))))
+
 (defn- value-valid? [kind value]
   (case kind
     "integer" (and (integer? value) (Double/isFinite (double value)))
     "number" (and (number? value) (Double/isFinite (double value)))
     "boolean" (boolean? value)
-    "date" (and (string? value)
-                (try (= value (str (LocalDate/parse value))) (catch Exception _ false)))
+    "date" (some? (canonical-date value))
     "datetime" (and (string? value) (<= (count value) 40)
                     (try (some? (OffsetDateTime/parse value)) (catch Exception _ false)))
     false))
@@ -158,7 +168,14 @@
                                   (every? true? (map #(boolean (value-valid? (:kind %1) %2)) columns row))))
                            rows))
       (unavailable!))
-    (let [safe {:status "completed" :data {:cols safe-cols :rows (mapv vec rows)} :row_count (count rows)}]
+    (let [safe-rows (mapv (fn [row]
+                            (mapv (fn [{:keys [kind base-type]} value]
+                                    (if (and (= kind "date") (= base-type "type/Date"))
+                                      (canonical-date value)
+                                      value))
+                                  columns row))
+                          rows)
+          safe {:status "completed" :data {:cols safe-cols :rows safe-rows} :row_count (count rows)}]
       (when (> (encoded-size safe) max-bytes)
         (unavailable!))
       safe)))

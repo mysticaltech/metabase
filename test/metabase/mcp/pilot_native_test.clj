@@ -289,6 +289,38 @@
         (doseq [path ["/api/mcp/subpath" "/api/mcp//" "/api/metabase-mcp/../agent"]]
           (is (= 403 (:status (initialize! access path)))))))))
 
+(deftest actual-native-date-question-projection-test
+  (with-native-pilot!
+    :crowberto
+    (fn [{:keys [tokens policy config collection user-id]}]
+      (mt/with-temp [:model/Card card {:name "Invented leap-day aggregate" :type :question :display :table
+                                       :database_id (mt/id) :collection_id (:id collection)
+                                       :dataset_query {:database (mt/id) :type :native
+                                                       :native {:query "SELECT DATE '2024-02-29' AS \"day\", 41 AS \"visits\""
+                                                                :template-tags {}}}}]
+        (let [warm (with-redefs [config/current (constantly {:mode :off})]
+                     (request/with-current-user user-id
+                       (tools/call-tool #{policy/execute-scope} (session/create! user-id)
+                                        "execute_question" {:id (:id card)})))
+              report (assoc fixture/report :id (:id card) :collection-id (:id collection) :database-id (mt/id)
+                            :columns [{:name "day" :base-type "type/Date" :kind "date"}
+                                      {:name "visits" :base-type "type/Integer" :kind "integer"}])
+              captured (request/with-current-user user-id (snapshot/capture! report))
+              p (assoc policy :reports [(assoc report :sha256 (policy/fingerprint (:root captured)))])]
+          (is (not (:isError warm)))
+          (is (= "type/Date" (get-in warm [:structuredContent :data :cols 0 :base_type])))
+          (with-redefs [config/current (constantly (assoc config :policy p))]
+            (let [access (:access_token tokens)
+                  init (initialize! access "/api/metabase-mcp")
+                  session-id (get-in init [:headers "Mcp-Session-Id"])
+                  result (:result (decoded-body (call! access session-id {:id (:id card)})))]
+              (is (= 200 (:status init)))
+              (is (nil? (:isError result)))
+              (is (= [["2024-02-29" 41]] (get-in result [:structuredContent :data :rows])))
+              (is (= (:structuredContent result)
+                     (when (:structuredContent result)
+                       (json/decode+kw (get-in result [:content 0 :text]))))))))))))
+
 (deftest native-refresh-revocation-expiry-and-client-drift-test
   (with-native-pilot!
     :crowberto

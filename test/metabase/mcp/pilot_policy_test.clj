@@ -3,6 +3,8 @@
    [clojure.test :refer [deftest is testing]]
    [metabase.mcp.pilot-policy :as pilot]))
 
+(set! *warn-on-reflection* true)
+
 (def report
   {:id 17
    :title "Invented website totals"
@@ -121,3 +123,75 @@
                             (pilot/safe-result! report bad)))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unavailable"
                         (pilot/safe-result! (assoc report :max-bytes 10) native-result))))
+
+(deftest date-midnight-wire-values-preserve-calendar-day-test
+  (doseq [day ["0000-02-29" "+10000-01-01" "-0001-01-01"]]
+    (is (= day (get-in (pilot/safe-result! report (assoc-in native-result [:data :rows 0 0] day))
+                       [:data :rows 0 0]))))
+  (doseq [wire ["2024-02-29" "2024-02-29T00:00:00" "2024-02-29T00:00:00.0"
+                "2024-02-29T00:00:00Z" "2024-02-29T00:00:00.000Z"
+                "2024-02-29T00:00:00.000000000+00:00" "2024-02-29T00:00:00-00:00"
+                "2024-02-29T00:00:00+14:00" "2024-02-29T00:00:00-12:00"
+                "2024-02-29T00:00:00+05:45" "2024-02-29T00:00:00-03:30"
+                "2024-02-29T00:00:00+18:00" "2024-02-29T00:00:00-18:00"
+                "2026-01-01T00:00:00+14:00" "2026-12-31T00:00:00-12:00"]]
+    (let [result (assoc-in native-result [:data :rows 0 0] wire)
+          expected (assoc-in native-result [:data :rows 0 0] (subs wire 0 10))]
+      (is (= (pilot/safe-result! report expected)
+             (try (pilot/safe-result! report result) (catch clojure.lang.ExceptionInfo _ ::unavailable)))
+          (str "Preserve the wire calendar day: " wire)))))
+
+(deftest date-wire-invalid-values-remain-unavailable-test
+  (doseq [wire [nil 20240229 true :date {} ["2024-02-29"] (java.time.LocalDate/of 2024 2 29)
+                "2023-02-29" "2024-02-30T00:00:00Z" "2023-02-29T00:00:00Z"
+                "2024-13-01T00:00:00Z" "2024-00-01T00:00:00Z"
+                "2024-02-29T01:00:00Z" "2024-02-29T00:01:00+14:00"
+                "2024-02-29T00:00:01-12:00" "2024-02-29T00:00:60Z"
+                "2024-02-29T24:00:00Z" "2024-02-29T00:00:00.000000001Z"
+                "2024-02-29T00:00:00.010Z" "2024-02-29T00:00:00.0000000000Z"
+                "2024-02-29T00:00:00+18:01" "2024-02-29T00:00:00-18:01"
+                "2024-02-29T00:00:00+19:00" "2024-02-29T00:00:00+10:60"
+                "2024-02-29T00:00:00+5:30" "2024-02-29T00:00:00+0500"
+                "2024-02-29T00:00Z" "2024-02-29 00:00:00Z"
+                "2024-2-29T00:00:00Z" "024-02-29T00:00:00Z" "+10000-02-29T00:00:00Z"
+                "2024-02-29t00:00:00z" "2024-02-29T00:00:00Z[UTC]"
+                "2024-02-29T00:00:00Zsuffix" "2024-02-29Z"
+                " 2024-02-29T00:00:00Z" "2024-02-29T00:00:00Z "
+                "2024-02-29T00:00:00Z\n" "2024-02-29T00:00:00Z\u0000"
+                (str "2024-02-29T00:00:00." (apply str (repeat 1000 "0")) "Z")]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unavailable"
+                          (pilot/safe-result! report (assoc-in native-result [:data :rows 0 0] wire)))))
+  (let [rows [["2024-02-29T00:00:00Z" 41 true] ["2024-02-29T00:00:01Z" 42 false]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (pilot/safe-result! report (assoc-in (assoc native-result :row_count 2) [:data :rows] rows))))))
+
+(deftest date-canonicalization-does-not-change-other-contracts-test
+  (doseq [wire ["2024-02-29T00:00:00+14:00" "2024-02-29T01:02:03-12:00"]]
+    (let [datetime-report (-> report
+                              (assoc-in [:columns 0 :base-type] "type/DateTime")
+                              (assoc-in [:columns 0 :kind] "datetime"))
+          result (-> native-result
+                     (assoc-in [:data :cols 0 :base_type] "type/DateTime")
+                     (assoc-in [:data :rows 0 0] wire))]
+      (is (= wire (get-in (pilot/safe-result! datetime-report result) [:data :rows 0 0])))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (pilot/safe-result! report (assoc-in native-result [:data :cols 0 :base_type] "type/DateTime"))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (pilot/safe-result! report (assoc-in native-result [:data :rows 0 1] "2024-02-29T00:00:00Z"))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (pilot/safe-result! (-> report
+                                       (assoc-in [:columns 0 :base-type] "type/DateTime")
+                                       (assoc-in [:columns 0 :kind] "datetime"))
+                                   (-> native-result
+                                       (assoc-in [:data :cols 0 :base_type] "type/DateTime")
+                                       (assoc-in [:data :rows 0 0] "2024-02-29T00:00:00")))))
+  (let [result (assoc-in native-result [:data :rows 0 0] "2024-02-29T00:00:00Z")
+        canonical (pilot/safe-result! report (assoc-in native-result [:data :rows 0 0] "2024-02-29"))
+        limit (pilot/encoded-size canonical)]
+    (is (= canonical (try (pilot/safe-result! (assoc report :max-bytes limit) result)
+                          (catch clojure.lang.ExceptionInfo _ ::unavailable))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (pilot/safe-result! (assoc report :max-bytes (dec limit)) result)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (pilot/safe-result! report (assoc-in (assoc result :row_count 4) [:data :rows]
+                                                      (vec (repeat 4 ["2024-02-29T00:00:00Z" 41 true]))))))))

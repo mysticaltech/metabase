@@ -8,7 +8,8 @@
    [metabase.mcp.pilot-snapshot :as snapshot]
    [metabase.mcp.pilot-tools :as pilot]
    [metabase.mcp.resources :as resources]
-   [metabase.mcp.tools :as tools]))
+   [metabase.mcp.tools :as tools]
+   [metabase.util.json :as json]))
 
 (set! *warn-on-reflection* true)
 
@@ -56,3 +57,21 @@
     (.write ^java.io.OutputStream buffer (.getBytes "abc" java.nio.charset.StandardCharsets/UTF_8))
     (is (= 3 (.size ^java.io.ByteArrayOutputStream buffer)))
     (is (thrown? clojure.lang.ExceptionInfo (.write ^java.io.OutputStream buffer (int 100))))))
+
+(deftest date-wire-tool-projection-is-canonical-and-complete-test
+  (with-redefs [auth/ensure-authorized! (constantly fixtures/policy)
+                snapshot/validate! (constantly {:root "invented-pinned-query"})]
+    (doseq [wire ["2024-02-29T00:00:00+14:00" "2024-02-29T00:00:00.000-12:00"
+                  "2024-02-29T00:00:00"]]
+      (let [native (assoc-in fixtures/native-result [:data :rows 0 0] wire)
+            result (pilot/call-tool #{policy/execute-scope} "execute_question" {:id 17}
+                                    (constantly {:structuredContent native}))]
+        (is (nil? (:isError result)))
+        (is (= [["2024-02-29" 41 true]] (get-in result [:structuredContent :data :rows])))
+        (is (= (:structuredContent result)
+               (when (:structuredContent result) (json/decode+kw (get-in result [:content 0 :text])))))))
+    (doseq [wire ["2024-02-29T00:00:01Z" "2023-02-29T00:00:00Z"]]
+      (is (= {:content [{:type "text" :text "Approved report unavailable."}] :isError true}
+             (pilot/call-tool #{policy/execute-scope} "execute_question" {:id 17}
+                              (constantly {:structuredContent
+                                           (assoc-in fixtures/native-result [:data :rows 0 0] wire)})))))))
