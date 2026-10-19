@@ -38,6 +38,7 @@
    [metabase.util.encryption :as encryption]
    [metabase.util.honey-sql-2 :as h2x]
    [metabase.util.i18n :as i18n]
+   [metabase.util.json :as json]
    [metabase.util.log :as log]
    [metabase.util.malli :as mu]
    [metabase.util.malli.registry :as mr]
@@ -383,8 +384,9 @@
                    (:uri request)
                    (boolean (or (:metabase-session-key request) (get-in request [:headers "x-api-key"])))))]
       (if error
+        ;; This early response bypasses the downstream JSON serializer.
         (respond {:status (:status error) :headers {"Content-Type" "application/json" "Cache-Control" "no-store"}
-                  :body {:message (:message error)}})
+                  :body (json/encode {:message (:message error)})})
         (let [request' (tracing/with-span :db-app "db-app.session-lookup" {}
                          (merge-current-user-info request))]
           (analytics/with-auth-method! (:embedding/auth-method request')
