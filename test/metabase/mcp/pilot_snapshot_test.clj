@@ -1,11 +1,16 @@
 (ns metabase.mcp.pilot-snapshot-test
   (:require
    [clojure.test :refer [deftest is testing]]
+   [metabase.api.common :as api]
    [metabase.lib-be.metadata.jvm :as lib.metadata.jvm]
+   [metabase.lib.core :as lib]
    [metabase.mcp.pilot-policy :as policy]
    [metabase.mcp.pilot-policy-test :as fixtures]
    [metabase.mcp.pilot-snapshot :as snapshot]
-   [metabase.util.json :as json]))
+   [metabase.test :as mt]
+   [metabase.util.json :as json]
+   [metabase.util.log.capture :as log.capture]
+   [toucan2.core :as t2]))
 
 (def card
   {:id 17 :database_id 7 :collection_id 4 :archived false :parameters []
@@ -92,3 +97,96 @@
     ;; Fixed invented definition only; compare this digest across separate test JVMs without printing SQL or DTOs.
     #_{:clj-kondo/ignore [:discouraged-var]}
     (println "NMCP_FIXED_DEFINITION_SHA256" (:sha256 pins))))
+
+(defn- diagnostic-node [id source-id]
+  (assoc api-card :id id
+         :result_metadata [{:name "visits" :base_type :type/Integer
+                            :display_name "NMCP6-SENTINEL-metadata-987654321"}]
+         :dataset_query {:database 7 :type :native
+                         :native {:query (if source-id (str "SELECT * FROM {{#" source-id "}}")
+                                             "SELECT 41 AS visits /* NMCP6-SENTINEL-SQL-987654321 */")
+                                  :template-tags (if source-id
+                                                   {(str "#" source-id) {:name (str "#" source-id)
+                                                                         :display-name "NMCP6-SENTINEL-tag"
+                                                                         :type :card :card-id source-id}}
+                                                   {})}}))
+
+(defn- snapshot-diagnostic! [fault]
+  (let [sentinel "NMCP6-SENTINEL-token-user-client-report-SQL-hash-values-987654321"
+        private-data {:token sentinel :user-id 987654321 :client-id sentinel :report-id 987654321
+                      :query sentinel :metadata sentinel :hash sentinel :rows [[sentinel]]}
+        failure (ex-info sentinel private-data (ex-info sentinel private-data))
+        root (diagnostic-node 17 18)
+        child (diagnostic-node 18 nil)
+        metadata {:cards {17 root 18 child} :collections {4 api-collection} :snippets {}}
+        report (merge fixtures/report (snapshot/pins-from-api fixtures/report metadata))
+        report (case fault
+                 :root-pin (assoc report :sha256 (apply str (repeat 64 "0")))
+                 :dependency-set (assoc report :dependencies [])
+                 :dependency-pin (assoc-in report [:dependencies 0 :sha256] (apply str (repeat 64 "0")))
+                 :collection-binding (assoc report :collection-id 5)
+                 report)
+        normalize (mt/original-fn #'lib/normalize)
+        references (mt/original-fn #'lib/all-template-tags)
+        fingerprint (mt/original-fn #'policy/fingerprint)
+        select! (fn [model id]
+                  (if (vector? model)
+                    (case fault
+                      :collection-read (throw failure)
+                      :collection-shape (dissoc api-collection :namespace)
+                      api-collection)
+                    (case fault
+                      :entity (throw failure)
+                      :entity-missing nil
+                      :entity-archived (assoc root :archived true)
+                      :required-shape (dissoc root :parameters)
+                      :cycle (diagnostic-node 17 17)
+                      :graph-limit (diagnostic-node id (inc id))
+                      :database-binding (assoc root :database_id 8)
+                      :parameters (assoc root :parameters [private-data])
+                      (get (:cards metadata) id))))]
+    (mt/with-dynamic-fn-redefs
+      [t2/select-one select!
+       api/read-check (fn [entity]
+                        (case fault
+                          :read-authority (throw failure)
+                          :read-authority-error (throw (Error. sentinel))
+                          entity))
+       lib/normalize (fn [& args] (if (= fault :normalization) (throw failure) (apply normalize args)))
+       lib/all-template-tags (fn [query] (if (= fault :references) (throw failure) (references query)))
+       policy/fingerprint (fn [node]
+                            (if (or (and (= fault :root-fingerprint) (= 17 (:id node)))
+                                    (and (= fault :dependency-fingerprint) (= 18 (:id node))))
+                              (throw failure)
+                              (fingerprint node)))]
+      (log.capture/with-log-messages-for-level [messages [metabase.mcp.pilot-snapshot :trace]]
+        (let [outcome (try (snapshot/validate! report) (catch Throwable e e))]
+          {:outcome outcome :logs (messages) :failure failure})))))
+
+(deftest snapshot-failure-diagnostics-are-finite-and-private-test
+  (doseq [[fault substage] [[:entity "entity"] [:entity-missing "entity"] [:entity-archived "entity"]
+                            [:read-authority "read-authority"] [:read-authority-error "read-authority"]
+                            [:required-shape "required-shape"]
+                            [:collection-read "collection-read"] [:collection-shape "collection-shape"]
+                            [:normalization "normalization"] [:references "references"] [:parameters "references"]
+                            [:cycle "cycle"] [:graph-limit "graph-limit"]
+                            [:database-binding "database-binding"] [:collection-binding "collection-binding"]
+                            [:root-fingerprint "root-fingerprint"] [:root-pin "root-pin"]
+                            [:dependency-set "dependency-set"]
+                            [:dependency-fingerprint "dependency-fingerprint"] [:dependency-pin "dependency-pin"]]]
+    (testing (name fault)
+      (let [{:keys [outcome logs failure]} (snapshot-diagnostic! fault)]
+        (is (instance? Throwable outcome))
+        (when (contains? #{:entity :read-authority :collection-read :normalization :references
+                           :root-fingerprint :dependency-fingerprint} fault)
+          (is (identical? failure outcome)))
+        ;; Exact equality excludes raw errors, stacks, sentinels, hashes and arbitrary extra fields.
+        (is (= [{:namespace 'metabase.mcp.pilot-snapshot :level :warn :e nil
+                 :message (str "MCP pilot snapshot failure substage=" substage)}]
+               logs))))))
+
+(deftest successful-snapshot-has-no-diagnostic-log-test
+  (let [{:keys [outcome logs]} (snapshot-diagnostic! nil)]
+    (is (= #{:root :dependencies} (set (keys outcome))))
+    (is (= #{["card" 18]} (set (keys (:dependencies outcome)))))
+    (is (empty? logs))))

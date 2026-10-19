@@ -4,6 +4,7 @@
    [metabase.api.common :as api]
    [metabase.lib.core :as lib]
    [metabase.mcp.pilot-policy :as policy]
+   [metabase.util.log :as log]
    [toucan2.core :as t2]))
 
 (def ^:private card-keys
@@ -13,6 +14,16 @@
 
 (def ^:private collection-keys [:id :location :namespace :archived])
 
+(defn- at-substage! [substage f]
+  (try
+    (f)
+    (catch Throwable e
+      (log/warnf "MCP pilot snapshot failure substage=%s" (name substage))
+      (throw e))))
+
+(defn- unavailable-at! [substage]
+  (at-substage! substage policy/unavailable!))
+
 (defn- complete? [entity fields]
   (and (map? entity) (every? #(contains? entity %) fields)))
 
@@ -20,74 +31,81 @@
   (when collection-id
     (when-not (and (complete? collection collection-keys)
                    (= collection-id (:id collection)) (false? (:archived collection)))
-      (policy/unavailable!))
+      (unavailable-at! :collection-shape))
     (-> (select-keys collection collection-keys)
         (update :namespace #(some-> % keyword)))))
 
 (defn- definition [[kind id] entity collection]
   (let [fields (case kind "card" card-keys "snippet" snippet-keys)]
     (when-not (and (complete? entity fields) (= id (:id entity)) (false? (:archived entity)))
-      (policy/unavailable!))
-    (cond-> (assoc (select-keys entity fields)
-                   :collection-binding (collection-binding (:collection_id entity) collection))
-      (= kind "card")
-      (-> (update :dataset_query #(->> (lib/->mbql5 %)
-                                       (lib/normalize :metabase.lib.schema/query)
-                                       lib/prepare-for-serialization))
-          (update :type #(some-> % keyword))
-          (update :display #(some-> % keyword))
-          (update :result_metadata #(not-empty (mapv lib/normalize-result-metadata-column %))))
-      (= kind "snippet")
-      (update :template_tags #(lib/normalize :metabase.lib.schema.template-tag/template-tag-map %)))))
+      (unavailable-at! :required-shape))
+    (let [binding (collection-binding (:collection_id entity) collection)]
+      (at-substage!
+       :normalization
+       (fn []
+         (cond-> (assoc (select-keys entity fields) :collection-binding binding)
+           (= kind "card")
+           (-> (update :dataset_query #(->> (lib/->mbql5 %)
+                                            (lib/normalize :metabase.lib.schema/query)
+                                            lib/prepare-for-serialization))
+               (update :type #(some-> % keyword))
+               (update :display #(some-> % keyword))
+               (update :result_metadata #(not-empty (mapv lib/normalize-result-metadata-column %))))
+           (= kind "snippet")
+           (update :template_tags #(lib/normalize :metabase.lib.schema.template-tag/template-tag-map %))))))))
 
 (defn- fetch-node [[kind id :as key]]
   (let [model (case kind "card" :model/Card "snippet" :model/NativeQuerySnippet)
-        entity (t2/select-one model id)]
+        entity (at-substage! :entity #(t2/select-one model id))]
     (when (or (nil? entity) (:archived entity))
-      (policy/unavailable!))
-    (api/read-check entity)
+      (unavailable-at! :entity))
+    (at-substage! :read-authority #(api/read-check entity))
     ;; Hash the same definition native persistence writes, never request-local metadata providers or caches.
     (definition key entity (when-let [collection-id (:collection_id entity)]
-                             (t2/select-one (into [:model/Collection] collection-keys) collection-id)))))
+                             (at-substage! :collection-read
+                                           #(t2/select-one (into [:model/Collection] collection-keys) collection-id))))))
 
 (defn- references [[kind _id] node]
-  (let [query (when (= kind "card")
-                (lib/normalize :metabase.lib.schema/query (lib/->mbql5 (:dataset_query node))))
-        tags (if query
-               (vec (lib/all-template-tags query))
-               (lib/normalize :metabase.lib.schema.template-tag/template-tags (:template_tags node)))
-        cards (if query (lib/all-source-card-ids query) (lib/template-tags->card-ids tags))
-        snippets (lib/template-tags->snippet-ids tags)]
-    (when (or (seq (:parameters node))
-              (some (fn [{:keys [type card-id snippet-id]}]
-                      (case type
-                        :card (not (pos-int? card-id))
-                        :snippet (not (pos-int? snippet-id))
-                        true))
-                    tags))
-      (policy/unavailable!))
-    (set (concat (map #(vector "card" %) cards) (map #(vector "snippet" %) snippets)))))
+  (at-substage!
+   :references
+   (fn []
+     (let [query (when (= kind "card")
+                   (lib/normalize :metabase.lib.schema/query (lib/->mbql5 (:dataset_query node))))
+           tags (if query
+                  (vec (lib/all-template-tags query))
+                  (lib/normalize :metabase.lib.schema.template-tag/template-tags (:template_tags node)))
+           cards (if query (lib/all-source-card-ids query) (lib/template-tags->card-ids tags))
+           snippets (lib/template-tags->snippet-ids tags)]
+       (when (or (seq (:parameters node))
+                 (some (fn [{:keys [type card-id snippet-id]}]
+                         (case type
+                           :card (not (pos-int? card-id))
+                           :snippet (not (pos-int? snippet-id))
+                           true))
+                       tags))
+         (policy/unavailable!))
+       (set (concat (map #(vector "card" %) cards) (map #(vector "snippet" %) snippets)))))))
 
 (defn- capture-with! [report fetch]
   (let [root ["card" (:id report)]
         nodes (atom {})]
     (letfn [(visit! [key ancestors]
               (when (contains? ancestors key)
-                (policy/unavailable!))
+                (unavailable-at! :cycle))
               (when-not (contains? @nodes key)
                 (when (>= (count @nodes) 65)
-                  (policy/unavailable!))
+                  (unavailable-at! :graph-limit))
                 (let [node (fetch key)]
                   (when (and (= "card" (first key))
                              (or (not= (:database-id report) (:database_id node))
                                  (not= (:database-id report) (get-in node [:dataset_query :database]))))
-                    (policy/unavailable!))
+                    (unavailable-at! :database-binding))
                   (swap! nodes assoc key node)
                   (doseq [dependency (references key node)]
                     (visit! dependency (conj ancestors key))))))]
       (visit! root #{})
       (when-not (= (:collection-id report) (get-in @nodes [root :collection_id]))
-        (policy/unavailable!))
+        (unavailable-at! :collection-binding))
       {:root (get @nodes root)
        :dependencies (dissoc @nodes root)})))
 
@@ -126,8 +144,12 @@
   [report]
   (let [{:keys [root dependencies] :as snapshot} (capture! report)
         pins (into {} (map (fn [{:keys [kind id sha256]}] [[kind id] sha256])) (:dependencies report))]
-    (when-not (and (= (:sha256 report) (policy/fingerprint root))
-                   (= (set (keys dependencies)) (set (keys pins)))
-                   (every? (fn [[key node]] (= (get pins key) (policy/fingerprint node))) dependencies))
-      (policy/unavailable!))
+    (when-not (= (:sha256 report) (at-substage! :root-fingerprint #(policy/fingerprint root)))
+      (unavailable-at! :root-pin))
+    (when-not (= (set (keys dependencies)) (set (keys pins)))
+      (unavailable-at! :dependency-set))
+    (when-not (every? (fn [[key node]]
+                        (= (get pins key) (at-substage! :dependency-fingerprint #(policy/fingerprint node))))
+                      dependencies)
+      (unavailable-at! :dependency-pin))
     snapshot))

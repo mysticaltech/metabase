@@ -4,13 +4,16 @@
    [clojure.java.jdbc :as jdbc]
    [clojure.test :refer [deftest is testing use-fixtures]]
    [metabase.agent-api.api :as agent-api]
+   [metabase.api.common :as api]
    [metabase.api.macros :as api.macros]
    [metabase.api.macros.scope :as api.scope]
    [metabase.collections-rest.api]
+   [metabase.collections.models.collection :as collection]
    [metabase.initialization-status.core :as init-status]
    [metabase.lib-be.metadata.jvm :as lib.metadata.jvm]
    [metabase.lib.core :as lib]
    [metabase.mcp.api :as mcp]
+   [metabase.mcp.pilot-auth :as pilot.auth]
    [metabase.mcp.pilot-config :as config]
    [metabase.mcp.pilot-policy :as policy]
    [metabase.mcp.pilot-policy-test :as fixture]
@@ -378,6 +381,78 @@
                                 (json/decode+kw (get-in result [:content 0 :text])))))
               (is (= before (capture)))
               (is (= pins (request/with-current-user user-id (snapshot/pins! report)))))))))))
+
+(deftest personal-model-runtime-snapshot-matches-api-pins-test
+  (one-off-dbs/with-blank-db
+    (jdbc/execute! one-off-dbs/*conn*
+                   ["CREATE TABLE nmcp_snapshot (report_day DATE NOT NULL, visits INTEGER NOT NULL)"])
+    (jdbc/execute! one-off-dbs/*conn*
+                   ["INSERT INTO nmcp_snapshot VALUES (DATE '2024-02-29', 41), (DATE '2024-03-01', 42)"])
+    (with-native-pilot!
+      :crowberto
+      (fn [{:keys [tokens policy config collection user-id]}]
+        (request/with-current-user user-id
+          (let [personal (collection/user->personal-collection user-id)]
+            (mt/with-temp [:model/Card source
+                           {:name "Invented rich snapshot model" :type :model :display :table
+                            :database_id (mt/id) :collection_id (:id collection)
+                            :dataset_query {:database (mt/id) :type :native
+                                            :native {:query (str "SELECT MAX(report_day) AS \"day\", "
+                                                                 "CAST(SUM(visits) AS INTEGER) AS \"visits\" FROM nmcp_snapshot")
+                                                     :template-tags {}}}}
+                           :model/Card root
+                           {:name "Invented personal snapshot root" :type :question :display :table
+                            :database_id (mt/id) :collection_id (:id personal)
+                            :dataset_query {:database (mt/id) :type :native
+                                            :native {:query (str "SELECT \"day\", \"visits\" FROM {{#" (:id source) "}}")
+                                                     :template-tags
+                                                     {(str "#" (:id source))
+                                                      {:name (str "#" (:id source)) :display-name "Invented source"
+                                                       :type :card :card-id (:id source)}}}}}]
+              (ordinary-agent-call! user-id (:id source) {})
+              (ordinary-agent-call! user-id (:id root) {})
+              (let [report (assoc fixture/report :id (:id root) :database-id (mt/id)
+                                  :collection-id (:id personal)
+                                  :columns [{:name "day" :base-type "type/Date" :kind "date"}
+                                            {:name "visits" :base-type "type/Integer" :kind "integer"}])
+                    metadata {:cards (into {} (for [id [(:id root) (:id source)]]
+                                                [id (api-json 'metabase.queries-rest.api.card id)]))
+                              :collections (into {} (for [id [(:id personal) (:id collection)]]
+                                                      [id (api-json 'metabase.collections-rest.api id)]))
+                              :snippets {}}
+                    before (snapshot/capture! report)
+                    pins (snapshot/pins-from-api report metadata)
+                    p (assoc policy :reports [(merge report pins)])
+                    validate! snapshot/validate!
+                    oauth-snapshots (atom [])]
+                (is (= user-id (:personal_owner_id personal)))
+                (is (not= (:id personal) (:id collection)))
+                (is (= :model (get-in before [:dependencies ["card" (:id source)] :type])))
+                (doseq [node (cons (:root before) (vals (:dependencies before)))]
+                  (is (= [:type/Date :type/Integer] (mapv :base_type (:result_metadata node))))
+                  (is (every? #(seq (get-in % [:fingerprint :type])) (:result_metadata node))))
+                (is (= 1 (count (:dependencies pins))))
+                (is (= pins (snapshot/pins! report)))
+                (is (= before (validate! (merge report pins))))
+                (with-redefs [config/current (constantly (assoc config :policy p))
+                              snapshot/validate!
+                              (fn [pinned-report]
+                                (is (= user-id api/*current-user-id*))
+                                (is (some? pilot.auth/*authorization*))
+                                (is (= p (pilot.auth/ensure-authorized!)))
+                                (is (= pins (snapshot/pins! pinned-report)))
+                                (let [captured (validate! pinned-report)]
+                                  (swap! oauth-snapshots conj captured)
+                                  captured))]
+                  (let [access (:access_token tokens)
+                        init (initialize! access "/api/metabase-mcp")
+                        session-id (get-in init [:headers "Mcp-Session-Id"])
+                        result (:result (decoded-body (call! access session-id {:id (:id root)})))]
+                    (is (= 200 (:status init)))
+                    (is (not (:isError result)))
+                    (is (= [["2024-03-01" 83]] (get-in result [:structuredContent :data :rows])))
+                    (is (= [before before] @oauth-snapshots))
+                    (is (= pins (snapshot/pins! report)))))))))))))
 
 (defn- with-mutable-date-pilot! [f]
   (one-off-dbs/with-blank-db
