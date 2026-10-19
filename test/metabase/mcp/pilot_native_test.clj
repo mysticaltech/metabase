@@ -1,8 +1,9 @@
 (ns metabase.mcp.pilot-native-test
   "Invented-H2 native OAuth, Ring transport and saved-question execution. No production configuration is used."
   (:require
+   [clojure.java.jdbc :as jdbc]
    [clojure.test :refer [deftest is testing use-fixtures]]
-   [metabase.agent-api.api]
+   [metabase.agent-api.api :as agent-api]
    [metabase.api.macros :as api.macros]
    [metabase.api.macros.scope :as api.scope]
    [metabase.collections-rest.api]
@@ -22,9 +23,11 @@
    [metabase.permissions.core :as perms]
    [metabase.permissions.models.permissions-group :as perms-group]
    [metabase.queries-rest.api.card]
+   [metabase.query-processor.card :as qp.card]
    [metabase.request.core :as request]
    [metabase.server.middleware.session :as middleware]
    [metabase.test :as mt]
+   [metabase.test.data.one-off-dbs :as one-off-dbs]
    [metabase.test.fixtures :as fixtures]
    [metabase.util.json :as json]
    [oidc-provider.core :as oidc]
@@ -320,6 +323,149 @@
               (is (= (:structuredContent result)
                      (when (:structuredContent result)
                        (json/decode+kw (get-in result [:content 0 :text]))))))))))))
+
+(defn- ordinary-agent-call! [user-id card-id injection]
+  (let [response (request/with-current-user user-id
+                   (invoke agent-api/routes
+                           (merge {:uri (str "/v1/question/" card-id "/query") :request-method :post
+                                   :metabase-user-id user-id :token-scopes #{policy/execute-scope}}
+                                  injection)))]
+    (is (contains? #{200 202} (:status response)))
+    (#'tools/capture-streaming-response (:body response))))
+
+(defn- with-mutable-date-pilot! [f]
+  (one-off-dbs/with-blank-db
+    (jdbc/execute! one-off-dbs/*conn*
+                   ["CREATE TABLE nmcp_counts (report_day DATE NOT NULL, visits INTEGER NOT NULL)"])
+    (jdbc/execute! one-off-dbs/*conn*
+                   ["INSERT INTO nmcp_counts VALUES (DATE '2024-02-29', 41)"])
+    (with-native-pilot!
+      :crowberto
+      (fn [{:keys [tokens policy config collection user-id] :as context}]
+        (mt/with-temp [:model/Card card
+                       {:name "Invented mutable daily aggregate" :type :question :display :table
+                        :database_id (mt/id) :collection_id (:id collection)
+                        :dataset_query
+                        {:database (mt/id) :type :native
+                         :native {:query (str "SELECT MAX(report_day) AS \"day\", "
+                                              "CAST(SUM(visits) AS INTEGER) AS \"visits\" FROM nmcp_counts")
+                                  :template-tags {}}}}]
+          (ordinary-agent-call! user-id (:id card) {})
+          (let [report (assoc fixture/report :id (:id card) :database-id (mt/id)
+                              :collection-id (:id collection)
+                              :columns [{:name "day" :base-type "type/Date" :kind "date"}
+                                        {:name "visits" :base-type "type/Integer" :kind "integer"}])
+                capture (fn [] (request/with-current-user user-id (snapshot/capture! report)))
+                before (capture)
+                pins (request/with-current-user user-id (snapshot/pins! report))
+                p (assoc policy :reports [(merge report pins)])]
+            (is (every? :fingerprint (get-in before [:root :result_metadata])))
+            (with-redefs [config/current (constantly (assoc config :policy p))]
+              (let [access (:access_token tokens)
+                    init (initialize! access "/api/metabase-mcp")
+                    session-id (get-in init [:headers "Mcp-Session-Id"])]
+                (is (= 200 (:status init)))
+                (f (assoc context :card card :policy p :before before :pins pins :capture capture
+                          :access access :session-id session-id))))))))))
+
+(defn- change-invented-day! []
+  (jdbc/execute! one-off-dbs/*conn*
+                 ["UPDATE nmcp_counts SET report_day = DATE '2024-03-01', visits = 42"]))
+
+(deftest mutable-native-date-metadata-isolation-test
+  (with-mutable-date-pilot!
+    (fn [{:keys [card access session-id capture before pins user-id policy]}]
+      (is (= [["2024-02-29" 41]]
+             (get-in (decoded-body (call! access session-id {:id (:id card)}))
+                     [:result :structuredContent :data :rows])))
+      (change-invented-day!)
+      (let [result (:result (decoded-body (call! access session-id {:id (:id card)})))]
+        (is (not (:isError result)))
+        (is (= [["2024-03-01" 42]] (get-in result [:structuredContent :data :rows])))
+        (is (= before (capture)))
+        (is (= pins (request/with-current-user user-id (snapshot/pins! (first (:reports policy)))))))
+      (testing "Ordinary execution persists metadata despite forged body/query/header markers"
+        (let [normal (ordinary-agent-call!
+                      user-id (:id card)
+                      {:headers {"metabase.agent-api.api/skip-results-metadata?" "true"
+                                 "x-metabase-skip-results-metadata" "true"}
+                       :query-params {"skip-results-metadata?" "true"
+                                      "metabase.agent-api.api/skip-results-metadata?" "true"}
+                       :body {::agent-api/skip-results-metadata? true :skip-results-metadata? true
+                              :middleware {:skip-results-metadata? true}}})]
+          (is (= 42 (get-in normal [:structuredContent :data :rows 0 1])))
+          (is (not= before (capture)))
+          (is (true? (get-in (decoded-body (call! access session-id {:id (:id card)})) [:result :isError]))))))))
+
+(deftest pilot-metadata-marker-cannot-be-forged-test
+  (with-mutable-date-pilot!
+    (fn [{:keys [card access session-id before capture user-id]}]
+      (doseq [args [{:id (:id card) ::agent-api/skip-results-metadata? true}
+                    {:id (:id card) :pilot? true}
+                    {:id (:id card) :middleware {:skip-results-metadata? true}}]]
+        (is (true? (get-in (decoded-body (call! access session-id args)) [:result :isError]))))
+      (is (= before (capture)))
+      (testing "Full metadata, SQL and collection definition edits still invalidate the original pins"
+        (let [original (t2/select-one :model/Card (:id card))
+              metadata (:result_metadata original)]
+          (doseq [change [{:result_metadata (assoc-in metadata [0 :semantic_type] :type/Category)}
+                          {:result_metadata (vec (reverse metadata))}
+                          {:result_metadata (assoc-in metadata [1 :fingerprint :global :distinct-count] 2)}
+                          {:dataset_query {:database (mt/id) :type :native
+                                           :native {:query "SELECT DATE '2024-02-29' AS day, 99 AS visits"
+                                                    :template-tags {}}}}
+                          {:collection_id nil}]]
+            (try
+              (t2/update! :model/Card (:id card) change)
+              (is (true? (get-in (decoded-body (call! access session-id {:id (:id card)})) [:result :isError])))
+              (finally
+                (t2/update! :model/Card (:id card)
+                            (select-keys original [:result_metadata :dataset_query :collection_id])))))))
+      (change-invented-day!)
+      (testing "Unconfigured native dispatch ignores forged caller options and keeps normal persistence"
+        (let [normal (with-redefs [config/current (constantly {:mode :off})]
+                       (request/with-current-user user-id
+                         (tools/call-tool #{policy/execute-scope} (session/create! user-id)
+                                          "execute_question" {:id (:id card)}
+                                          {::agent-api/skip-results-metadata? true
+                                           :pilot? true :skip-results-metadata? true})))]
+          (is (not (:isError normal)))
+          (is (= 42 (get-in normal [:structuredContent :data :rows 0 1])))
+          (is (not= before (capture))))))))
+
+(deftest concurrent-pilot-and-ordinary-metadata-are-separated-test
+  (with-mutable-date-pilot!
+    (fn [{:keys [card access session-id before capture user-id collection]}]
+      (mt/with-temp [:model/Card normal-card
+                     {:name "Invented ordinary aggregate" :type :question :display :table
+                      :database_id (mt/id) :collection_id (:id collection)
+                      :dataset_query (:dataset_query card)}]
+        (ordinary-agent-call! user-id (:id normal-card) {})
+        (let [normal-before (:result_metadata (t2/select-one :model/Card (:id normal-card)))
+              ids #{(:id card) (:id normal-card)}
+              seen (atom {})
+              started (promise)
+              original qp.card/process-query-for-card]
+          (change-invented-day!)
+          (mt/with-dynamic-fn-redefs
+            [qp.card/process-query-for-card
+             (fn [current-card export-format & options]
+               (when (ids (:id current-card))
+                 (when (= ids (set (keys (swap! seen assoc (:id current-card)
+                                                (:middleware (apply hash-map options))))))
+                   (deliver started true))
+                 (is (true? (deref started 10000 ::timeout))))
+               (apply original current-card export-format options))]
+            (let [pilot (future (:result (decoded-body (call! access session-id {:id (:id card)}))))
+                  ordinary (future (ordinary-agent-call! user-id (:id normal-card) {}))
+                  pilot-result (deref pilot 45000 ::timeout)
+                  ordinary-result (deref ordinary 45000 ::timeout)]
+              (is (= [["2024-03-01" 42]] (get-in pilot-result [:structuredContent :data :rows])))
+              (is (= 42 (get-in ordinary-result [:structuredContent :data :rows 0 1])))
+              (is (true? (get-in @seen [(:id card) :skip-results-metadata?])))
+              (is (not (contains? (get @seen (:id normal-card)) :skip-results-metadata?)))
+              (is (= before (capture)))
+              (is (not= normal-before (:result_metadata (t2/select-one :model/Card (:id normal-card))))))))))))
 
 (deftest native-refresh-revocation-expiry-and-client-drift-test
   (with-native-pilot!

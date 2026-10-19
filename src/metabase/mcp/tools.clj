@@ -385,12 +385,13 @@
    For POST/PUT/PATCH requests, `params` is sent as the request body.
    For other methods (GET/DELETE), `params` is sent as parsed query params.
    Materializes StreamingResponse bodies in-process before delivering."
-  [result method path token-scopes params]
+  [result method path token-scopes params pilot?]
   (agent-api/routes
    (cond-> {:request-method   method
             :uri              path
             :metabase-user-id api/*current-user-id*
             :token-scopes     token-scopes}
+     (true? pilot?) (assoc ::agent-api/skip-results-metadata? true)
      ;; POST/PUT/PATCH carry params in the body; GET/DELETE carry them as query params.
      (and (seq params) (#{:post :put :patch} method))    (assoc :body params)
      (and (seq params) (not (#{:post :put :patch} method))) (assoc :query-params params))
@@ -415,9 +416,9 @@
 
    `body-transform-fn`, when provided, is applied to the 200 response body before
    wrapping with text-content. Used to post-process construct_query results."
-  [method path token-scopes params & {:keys [body-transform-fn]}]
+  [method path token-scopes params & {:keys [body-transform-fn pilot?]}]
   (let [result (promise)]
-    (deliver-agent-api-response result method path token-scopes params)
+    (deliver-agent-api-response result method path token-scopes params pilot?)
     (let [response (deref result 30000 {:status 504 :body {:message "Timeout"}})]
       (cond
         ;; Already materialized from a StreamingResponse
@@ -459,7 +460,7 @@
    and calls `invoke-agent-api`. For POST/PUT/PATCH requests, remaining args are
    sent as the request body. For other methods (GET/DELETE), remaining args are
    sent as query params."
-  [tool-def arguments token-scopes session-id]
+  [tool-def arguments token-scopes session-id pilot?]
   (let [{:keys [method path]} (:endpoint tool-def)
         tool-name             (:name tool-def)
         method                (keyword (u/lower-case-en method))
@@ -470,6 +471,7 @@
                                 (make-store-construct-query-result
                                  session-id api/*current-user-id*))]
     (invoke-agent-api method api-path token-scopes remaining-args
+                      :pilot? (and (true? pilot?) (= tool-name "execute_question"))
                       :body-transform-fn body-transform-fn)))
 
 ;; --- Design note: centralized null-stripping at the MCP boundary --------------------------------
@@ -507,6 +509,8 @@
   ([token-scopes session-id tool-name arguments]
    (call-native-tool token-scopes session-id tool-name arguments {:supports-mcp-ui? true}))
   ([token-scopes session-id tool-name arguments options]
+   (call-native-tool token-scopes session-id tool-name arguments options false))
+  ([token-scopes session-id tool-name arguments options pilot?]
    (let [arguments (drop-nil-args arguments)
          supported (supported-extensions options)]
      (if-let [ui-tool (some #(when (= tool-name (:name %)) %) (mcp.resources/list-ui-tools))]
@@ -526,7 +530,7 @@
                (if (= arguments ::handle-not-found)
                  (error-content "Query handle not found. The query may have expired — try running construct_query again.")
                  (try
-                   (dispatch-via-agent-api tool-def arguments token-scopes session-id)
+                   (dispatch-via-agent-api tool-def arguments token-scopes session-id pilot?)
                    (catch Exception e
                      (error-content (or (ex-message e) "Internal error"))))))))
          (error-content (str "Unknown tool: " tool-name)))))))
@@ -538,5 +542,6 @@
   ([token-scopes session-id tool-name arguments options]
    (if (pilot.auth/restricted-request?)
      (pilot.tools/call-tool token-scopes tool-name arguments
-                            #(call-native-tool token-scopes session-id tool-name arguments options))
+                            ;; Only this post-authorization callback can mark the fresh internal request.
+                            #(call-native-tool token-scopes session-id tool-name arguments options true))
      (call-native-tool token-scopes session-id tool-name arguments options))))

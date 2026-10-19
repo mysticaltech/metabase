@@ -1182,13 +1182,16 @@
            :annotations {:read-only? true :idempotent? true}}}
   [{:keys [id]} :- [:map [:id ms/PositiveInt]]
    _query-params
-   _body]
+   _body
+   request]
   (let [card (api/check-404 (t2/select-one :model/Card id))]
     (reject-parameterized-card! card)
     (qp.card/process-query-for-card
      card :api
      :context    :question
-     :middleware {:process-viz-settings? false})))
+     ;; The marker is a server-created Ring attribute, never a body/query/header option.
+     :middleware (cond-> {:process-viz-settings? false}
+                   (true? (::skip-results-metadata? request)) (assoc :skip-results-metadata? true)))))
 
 ;;; ------------------------------------------------ Create Dashboard -----------------------------------------------
 
