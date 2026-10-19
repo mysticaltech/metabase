@@ -333,6 +333,52 @@
     (is (contains? #{200 202} (:status response)))
     (#'tools/capture-streaming-response (:body response))))
 
+(deftest actual-native-source-model-dependency-execution-test
+  (with-native-pilot!
+    :crowberto
+    (fn [{:keys [tokens policy config collection user-id]}]
+      (mt/with-temp [:model/Card source
+                     {:name "Invented dated source model" :type :model :display :table
+                      :database_id (mt/id) :collection_id (:id collection)
+                      :dataset_query {:database (mt/id) :type :native
+                                      :native {:query "SELECT DATE '2024-02-29' AS \"day\", 41 AS \"visits\""
+                                               :template-tags {}}}}
+                     :model/Card root
+                     {:name "Invented model-backed aggregate" :type :question :display :table
+                      :database_id (mt/id) :collection_id (:id collection)
+                      :dataset_query {:database (mt/id) :type :native
+                                      :native {:query (str "SELECT \"day\", \"visits\" FROM {{#" (:id source) "}}")
+                                               :template-tags
+                                               {(str "#" (:id source))
+                                                {:name (str "#" (:id source)) :display-name "Invented source"
+                                                 :type :card :card-id (:id source)}}}}}]
+        (ordinary-agent-call! user-id (:id source) {})
+        (let [ordinary (ordinary-agent-call! user-id (:id root) {})
+              report (assoc fixture/report :id (:id root) :database-id (mt/id)
+                            :collection-id (:id collection)
+                            :columns [{:name "day" :base-type "type/Date" :kind "date"}
+                                      {:name "visits" :base-type "type/Integer" :kind "integer"}])
+              capture (fn [] (request/with-current-user user-id (snapshot/capture! report)))
+              before (capture)
+              pins (request/with-current-user user-id (snapshot/pins! report))
+              p (assoc policy :reports [(merge report pins)])
+              expected (policy/safe-result! report (:structuredContent ordinary))]
+          (is (= [["2024-02-29" 41]] (get-in expected [:data :rows])))
+          (is (= 1 (count (:dependencies pins))))
+          (is (= :model (get-in before [:dependencies ["card" (:id source)] :type])))
+          (with-redefs [config/current (constantly (assoc config :policy p))]
+            (let [access (:access_token tokens)
+                  init (initialize! access "/api/metabase-mcp")
+                  session-id (get-in init [:headers "Mcp-Session-Id"])
+                  result (:result (decoded-body (call! access session-id {:id (:id root)})))]
+              (is (= 200 (:status init)))
+              (is (not (:isError result)))
+              (is (= expected (:structuredContent result)))
+              (is (= expected (when (:structuredContent result)
+                                (json/decode+kw (get-in result [:content 0 :text])))))
+              (is (= before (capture)))
+              (is (= pins (request/with-current-user user-id (snapshot/pins! report)))))))))))
+
 (defn- with-mutable-date-pilot! [f]
   (one-off-dbs/with-blank-db
     (jdbc/execute! one-off-dbs/*conn*

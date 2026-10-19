@@ -5,7 +5,8 @@
    [metabase.mcp.pilot-auth :as auth]
    [metabase.mcp.pilot-policy :as policy]
    [metabase.mcp.pilot-snapshot :as snapshot]
-   [metabase.util.json :as json])
+   [metabase.util.json :as json]
+   [metabase.util.log :as log])
   (:import
    (java.io ByteArrayOutputStream)))
 
@@ -49,18 +50,27 @@
 (defn call-tool
   "Call native execution only after every policy/pin check; release no result until postchecks pass."
   [token-scopes tool arguments invoke-native]
-  (try
-    (let [p (authorized-policy! token-scopes)
-          report (policy/validate-arguments! p tool arguments)
-          before (snapshot/validate! report)
-          result (invoke-native)]
-      (when (:isError result) (policy/unavailable!))
-      (when-not (and (= p (authorized-policy! token-scopes))
-                     (= before (snapshot/validate! report)))
-        (policy/unavailable!))
-      (let [safe (policy/safe-result! report (:structuredContent result))
-            response {:content [{:type "text" :text (json/encode safe)}] :structuredContent safe}]
-        (when (> (policy/encoded-size response) (:max-bytes report)) (policy/unavailable!))
-        response))
-    (catch Throwable _
-      {:content [{:type "text" :text "Approved report unavailable."}] :isError true})))
+  (let [stage (volatile! :pre-auth)]
+    (try
+      (let [p (authorized-policy! token-scopes)
+            _ (vreset! stage :arguments)
+            report (policy/validate-arguments! p tool arguments)
+            _ (vreset! stage :pre-pin)
+            before (snapshot/validate! report)
+            _ (vreset! stage :native-invocation)
+            result (invoke-native)]
+        (vreset! stage :native-error)
+        (when (:isError result) (policy/unavailable!))
+        (vreset! stage :post-auth)
+        (when-not (= p (authorized-policy! token-scopes)) (policy/unavailable!))
+        (vreset! stage :post-pin)
+        (when-not (= before (snapshot/validate! report)) (policy/unavailable!))
+        (vreset! stage :safe-result)
+        (let [safe (policy/safe-result! report (:structuredContent result))
+              _ (vreset! stage :final-envelope)
+              response {:content [{:type "text" :text (json/encode safe)}] :structuredContent safe}]
+          (when (> (policy/encoded-size response) (:max-bytes report)) (policy/unavailable!))
+          response))
+      (catch Throwable _
+        (log/warnf "MCP pilot failure stage=%s" (name @stage))
+        {:content [{:type "text" :text "Approved report unavailable."}] :isError true}))))

@@ -9,11 +9,76 @@
    [metabase.mcp.pilot-tools :as pilot]
    [metabase.mcp.resources :as resources]
    [metabase.mcp.tools :as tools]
-   [metabase.util.json :as json]))
+   [metabase.test :as mt]
+   [metabase.util.json :as json]
+   [metabase.util.log.capture :as log.capture]))
 
 (set! *warn-on-reflection* true)
 
 (defn- successful-native [] {:structuredContent fixtures/native-result})
+
+(defn- diagnostic-call! [fault]
+  (let [sentinel "NMCP-5-SENTINEL-token-user-client-report-SQL-rows-987654321"
+        private-data {:token sentinel :user-id 987654321 :client-id sentinel :report-id 987654321
+                      :url sentinel :query sentinel :metadata sentinel :rows [[sentinel]]}
+        fail! #(throw (ex-info sentinel private-data (ex-info sentinel private-data)))
+        report (cond-> fixtures/report
+                 (= fault :final-envelope)
+                 (assoc :max-bytes (policy/encoded-size
+                                    (policy/safe-result! fixtures/report fixtures/native-result))))
+        p (assoc fixtures/policy :reports [report])
+        auth-checks (atom 0)
+        pin-checks (atom 0)
+        native (assoc fixtures/native-result :json_query private-data)
+        args (cond-> {:id 17} (= fault :arguments) (assoc :private private-data))]
+    (mt/with-dynamic-fn-redefs
+      [auth/ensure-authorized!
+       (fn []
+         (let [check (swap! auth-checks inc)]
+           (cond
+             (or (= fault :pre-auth) (and (= fault :post-auth) (> check 1))) (fail!)
+             (and (= fault :post-auth-change) (> check 1)) (assoc p :user-id 24)
+             :else p)))
+       snapshot/validate!
+       (fn [_]
+         (let [check (swap! pin-checks inc)]
+           (cond
+             (or (= fault :pre-pin) (and (= fault :post-pin-error) (> check 1))) (fail!)
+             (and (= fault :post-pin) (> check 1)) {:root private-data :changed sentinel}
+             :else {:root private-data})))]
+      (log.capture/with-log-messages-for-level [messages [metabase.mcp.pilot-tools :trace]]
+        (let [result (pilot/call-tool
+                      #{policy/execute-scope} "execute_question" args
+                      (fn []
+                        (case fault
+                          :native-invocation (fail!)
+                          :native-invocation-error (throw (Error. sentinel))
+                          :native-error {:isError true :content [{:type "text" :text sentinel}]
+                                         :structuredContent private-data}
+                          :safe-result {:structuredContent (assoc-in native [:data :rows 0 0] sentinel)}
+                          {:structuredContent native})))]
+          {:result result :logs (messages)})))))
+
+(deftest failure-stage-diagnostics-are-finite-and-private-test
+  (doseq [[fault stage] [[:pre-auth "pre-auth"] [:arguments "arguments"] [:pre-pin "pre-pin"]
+                         [:native-invocation "native-invocation"]
+                         [:native-invocation-error "native-invocation"] [:native-error "native-error"]
+                         [:post-auth "post-auth"] [:post-auth-change "post-auth"]
+                         [:post-pin "post-pin"] [:post-pin-error "post-pin"]
+                         [:safe-result "safe-result"] [:final-envelope "final-envelope"]]]
+    (testing (name fault)
+      (let [{:keys [result logs]} (diagnostic-call! fault)]
+        (is (= {:content [{:type "text" :text "Approved report unavailable."}] :isError true} result))
+        ;; Exact entries exclude sentinels, exception objects/stacks and any input/result-derived fields.
+        (is (= [{:namespace 'metabase.mcp.pilot-tools :level :warn :e nil
+                 :message (str "MCP pilot failure stage=" stage)}]
+               logs))))))
+
+(deftest successful-tool-execution-has-no-diagnostic-log-test
+  (let [{:keys [result logs]} (diagnostic-call! nil)]
+    (is (= (policy/safe-result! fixtures/report fixtures/native-result) (:structuredContent result)))
+    (is (nil? (:isError result)))
+    (is (empty? logs))))
 
 (deftest native-output-and-pre-post-checks-test
   (let [calls (atom 0)
