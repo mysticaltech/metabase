@@ -117,6 +117,16 @@
                   ;; hardcoding the scope string in the view.
                   :full-access? (= s oauth-server/full-access-scope)})))))
 
+(defn- pilot-error-response [e]
+  (when (contains? #{:metabase.mcp.pilot-config/unavailable :metabase.mcp.pilot-auth/denied}
+                   (:type (ex-data e)))
+    (let [unavailable? (= 503 (:status-code (ex-data e)))]
+      {:status (if unavailable? 503 403)
+       :headers {"Content-Type" "application/json" "Cache-Control" "no-store"}
+       :body {:error (if unavailable? "temporarily_unavailable" "access_denied")
+              :error_description (if unavailable? "MCP pilot configuration unavailable."
+                                     "MCP pilot authorization unavailable.")}})))
+
 (defn- redirect-authorization-decision
   "Issue a 302 redirect for an approved or denied authorization decision, clearing the CSRF cookie."
   [provider parsed approved request]
@@ -271,7 +281,7 @@
 
 #_{:clj-kondo/ignore [:metabase/validate-defendpoint-query-params-use-kebab-case]}
 (api.macros/defendpoint :get "/authorize"
-  :- [:map [:status [:enum 200 302 400 404]] [:body [:or :string :map]]]
+  :- [:map [:status [:enum 200 302 400 403 404 503]] [:body [:or :string :map]]]
   "Handles the authorization endpoint (GET /oauth/authorize)."
   [_route-params
    query-params :- [:map
@@ -294,6 +304,7 @@
     (or (when-let [provider (oauth-server/get-provider)]
           (try
             (let [parsed       (oidc/parse-authorization-request provider query-params)
+                  _            (oauth-server/validate-pilot-authorization! parsed (:metabase-user-id request))
                   client       (proto/get-client (:client-store provider) (:client_id parsed))
                   csrf-token   (generate-csrf-token)
                   oauth-params (select-keys parsed oauth-param-keys)
@@ -309,15 +320,16 @@
                               :oauth-params oauth-params})}
                   (response/set-cookie csrf-cookie-name csrf-token (csrf-cookie-opts 600))))
             (catch ExceptionInfo e
-              (log/warnf "OAuth authorize request failed: %s" (ex-message e))
-              {:status  400
-               :headers {"Content-Type" "application/json"}
-               :body    {:error             "invalid_request"
-                         :error_description "The authorization request is invalid."}})))
+              (or (pilot-error-response e)
+                  (do
+                    (log/warnf "OAuth authorize request failed: %s" (ex-message e))
+                    {:status 400 :headers {"Content-Type" "application/json"}
+                     :body {:error "invalid_request"
+                            :error_description "The authorization request is invalid."}})))))
         {:status 404 :body {:error "not_found"}})))
 
 (api.macros/defendpoint :post "/authorize/decision"
-  :- [:map [:status [:enum 302 400 401 403 404 429]] [:body [:or :string :map]]]
+  :- [:map [:status [:enum 302 400 401 403 404 429 503]] [:body [:or :string :map]]]
   "Handles the authorization decision (POST /oauth/authorize/decision)."
   [_route-params
    _query-params
@@ -355,6 +367,7 @@
                 (let [approved (= "true" (str (:approved body)))]
                   (try
                     (let [parsed        (oidc/parse-authorization-request provider auth-params)
+                          _             (oauth-server/validate-pilot-authorization! parsed (:metabase-user-id request))
                           ;; Verify the HMAC against the *parsed* params (same normalized form as the consent page).
                           ;; This must happen after parsing to ensure form-encoding round-trips don't cause mismatches.
                           parsed-params (select-keys parsed oauth-param-keys)]
@@ -367,15 +380,16 @@
                          :body    {:error "params_tampered"}}
                         (redirect-authorization-decision provider parsed approved request)))
                     (catch ExceptionInfo e
-                      (log/warnf "OAuth authorization decision failed: %s" (ex-message e))
-                      {:status  400
-                       :headers {"Content-Type" "application/json"}
-                       :body    {:error             "invalid_request"
-                                 :error_description "The authorization request is invalid."}}))))))
+                      (or (pilot-error-response e)
+                          (do
+                            (log/warnf "OAuth authorization decision failed: %s" (ex-message e))
+                            {:status 400 :headers {"Content-Type" "application/json"}
+                             :body {:error "invalid_request"
+                                    :error_description "The authorization request is invalid."}}))))))))
           {:status 404 :body {:error "not_found"}}))))
 
 (api.macros/defendpoint :post "/token"
-  :- [:map [:status [:enum 200 400 401 404 429]] [:body :map]]
+  :- [:map [:status [:enum 200 400 401 403 404 429 503]] [:body :map]]
   "Handles the token endpoint (POST /oauth/token)."
   [_route-params
    _query-params
@@ -400,6 +414,7 @@
       (or (when-let [provider (oauth-server/get-provider)]
             (let [authorization-header (get-in request [:headers "authorization"])]
               (try
+                (oauth-server/validate-pilot-token-request! provider body)
                 (let [response (oidc/token-request provider body authorization-header)]
                   {:status  200
                    :headers {"Content-Type"  "application/json"
@@ -407,15 +422,17 @@
                              "Pragma"        "no-cache"}
                    :body    response})
                 (catch ExceptionInfo e
-                  (log/warnf "OAuth token request failed: %s" (ex-message e))
-                  (let [data  (ex-data e)
-                        error (or (:error data) "invalid_request")]
-                    {:status  (if (= error "invalid_client") 401 400)
-                     :headers {"Content-Type"  "application/json"
-                               "Cache-Control" "no-store"
-                               "Pragma"        "no-cache"}
-                     :body    {:error             error
-                               :error_description (or (:error_description data) "The token request is invalid.")}})))))
+                  (or (pilot-error-response e)
+                      (do
+                        (log/warnf "OAuth token request failed: %s" (ex-message e))
+                        (let [data  (ex-data e)
+                              error (or (:error data) "invalid_request")]
+                          {:status  (if (= error "invalid_client") 401 400)
+                           :headers {"Content-Type"  "application/json"
+                                     "Cache-Control" "no-store"
+                                     "Pragma"        "no-cache"}
+                           :body    {:error             error
+                                     :error_description (or (:error_description data) "The token request is invalid.")}})))))))
           {:status 404 :body {:error "not_found"}}))))
 
 (api.macros/defendpoint :post "/revoke"

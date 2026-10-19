@@ -15,6 +15,7 @@
    [metabase.api.common :as api]
    [metabase.api.macros.defendpoint.tools-manifest :as tools-manifest]
    [metabase.config.core :as config]
+   [metabase.mcp.pilot-auth :as pilot.auth]
    [metabase.mcp.scope :as mcp.scope]
    [metabase.mcp.session :as mcp.session]
    [metabase.request.core :as request]
@@ -230,17 +231,19 @@
 (defn list-ui-tools
   "Return the list of MCP tools corresponding to UI components."
   []
-  (vals (:tools @registry)))
+  (when-not (pilot.auth/restricted-request?)
+    (vals (:tools @registry))))
 
 (defn list-resources
   "Return the MCP `resources/list` payload, filtered by `token-scopes`."
   [token-scopes]
-  {:resources (into []
-                    (comp (filter #(mcp.scope/public-or-matches? token-scopes (:scope %)))
-                          (map (fn [resource]
-                                 (cond-> (select-keys resource [:uri :name :description :mimeType])
-                                   (:ui? resource) (assoc :_meta (ui-meta resource))))))
-                    (vals (:uri->resource @registry)))})
+  {:resources (if (pilot.auth/restricted-request?) []
+                  (into []
+                        (comp (filter #(mcp.scope/public-or-matches? token-scopes (:scope %)))
+                              (map (fn [resource]
+                                     (cond-> (select-keys resource [:uri :name :description :mimeType])
+                                       (:ui? resource) (assoc :_meta (ui-meta resource))))))
+                        (vals (:uri->resource @registry))))})
 
 (def ^:private compatible-mcp-app-uri-pattern
   #"^ui://metabase/(visualize-query|render-drill-through)(?:-v2|\.[0-9a-f]+)?\.html$")
@@ -266,11 +269,13 @@
   "Check whether `uri` exists and is accessible under `token-scopes`.
    Returns :ok, :not-found, or :scope-denied."
   [uri token-scopes]
-  (if-let [{:keys [scope]} (resource-for-uri uri)]
-    (if (mcp.scope/public-or-matches? token-scopes scope)
-      :ok
-      :scope-denied)
-    :not-found))
+  (if (pilot.auth/restricted-request?)
+    :scope-denied
+    (if-let [{:keys [scope]} (resource-for-uri uri)]
+      (if (mcp.scope/public-or-matches? token-scopes scope)
+        :ok
+        :scope-denied)
+      :not-found)))
 
 (defn read-resource
   "Read a registered resource by URI, gated by `token-scopes`. Returns one of
@@ -278,14 +283,16 @@
    `{:status :not-found}`. Resource resolution and scope enforcement use the same
    immutable registry snapshot, so aliases cannot bypass the scope check."
   [uri token-scopes opts]
-  (if-let [{:keys [render-fn scope ui?] :as resource} (resource-for-uri uri)]
-    (if (mcp.scope/public-or-matches? token-scopes scope)
-      {:status   :ok
-       :contents [(cond-> (select-keys resource [:uri :mimeType])
-                    true (assoc :text (render-fn (assoc opts :resource-uri uri)))
-                    ui?  (assoc :_meta (ui-meta resource)))]}
-      {:status :scope-denied})
-    {:status :not-found}))
+  (if (pilot.auth/restricted-request?)
+    {:status :scope-denied}
+    (if-let [{:keys [render-fn scope ui?] :as resource} (resource-for-uri uri)]
+      (if (mcp.scope/public-or-matches? token-scopes scope)
+        {:status   :ok
+         :contents [(cond-> (select-keys resource [:uri :mimeType])
+                      true (assoc :text (render-fn (assoc opts :resource-uri uri)))
+                      ui?  (assoc :_meta (ui-meta resource)))]}
+        {:status :scope-denied})
+      {:status :not-found})))
 
 ;;; -------------------------------------------------- Helpers ----------------------------------------------------
 

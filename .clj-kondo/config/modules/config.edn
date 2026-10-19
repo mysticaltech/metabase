@@ -1242,6 +1242,7 @@
            api
            app-db
            config
+           lib
            llm
            oauth-server
            request
@@ -1249,7 +1250,12 @@
            session
            settings
            system
-           util}}
+           util}
+   :model-imports #{:model/Card
+                    :model/Collection
+                    :model/NativeQuerySnippet
+                    :model/OAuthClient
+                    :model/User}}
 
   measures
   {:team "Graphy"
@@ -1497,7 +1503,8 @@
            system
            task
            tracing
-           util}}
+           util}
+   :model-exports #{:model/OAuthClient}}
 
   osi
   {:team "Metabot"

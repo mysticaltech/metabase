@@ -4,11 +4,33 @@
   (:require
    [clojure.string :as str]
    [metabase.api.macros :as api.macros]
+   [metabase.mcp.pilot-auth :as pilot.auth]
+   [metabase.mcp.pilot-config :as pilot.config]
    [metabase.mcp.resources :as mcp.resources]
    [metabase.mcp.session :as mcp.session]
    [metabase.mcp.settings :as mcp.settings]))
 
 (set! *warn-on-reflection* true)
+
+(defn pilot-configuration
+  "Current bounded MCP pilot deployment state."
+  []
+  (pilot.config/current))
+
+(defn validate-pilot-grant!
+  "Apply the configured pilot ceiling to a stored or proposed native OAuth grant."
+  [grant]
+  (pilot.auth/validate-grant! grant))
+
+(defn validate-pilot-token-client!
+  "Refuse OAuth redemption/refresh when pilot configuration cannot classify the client."
+  [client-id]
+  (pilot.auth/validate-token-client! client-id))
+
+(defn pilot-bearer-request-error
+  "Return a pre-authentication rejection when a supplied Bearer cannot safely reach this route."
+  [config client-id path mixed-auth?]
+  (pilot.auth/bearer-request-error config client-id path mixed-auth?))
 
 (defn cors-origins
   "Returns space-separated CORS origins from both common and custom MCP client settings."

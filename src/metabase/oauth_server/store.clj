@@ -1,11 +1,24 @@
 (ns metabase.oauth-server.store
   "Database-backed implementations of OAuth provider storage protocols."
   (:require
+   [metabase.mcp.core :as mcp]
    [metabase.util :as u]
    [oidc-provider.protocol :as proto]
+   [oidc-provider.util :as oidc.util]
    [toucan2.core :as t2]))
 
 (set! *warn-on-reflection* true)
+
+(defn- checked-grant [grant]
+  (when grant
+    (mcp/validate-pilot-grant! grant)
+    grant))
+
+(defn access-token-client-id
+  "Identify a token's registered client even after revocation/expiry, solely for pre-fallback routing checks."
+  [token]
+  (when (seq token)
+    (t2/select-one-fn :client_id :model/OAuthAccessToken :token (oidc.util/hash-token token))))
 
 ;;; ------------------------------------------------- Helpers ----------------------------------------------------------
 
@@ -144,6 +157,7 @@
 (defrecord DbAuthorizationCodeStore []
   proto/AuthorizationCodeStore
   (save-authorization-code [_ code user-id client-id redirect-uri scope nonce expiry code-challenge code-challenge-method resource]
+    (checked-grant {:user-id user-id :client-id client-id :scope scope :resource resource})
     (t2/insert! :model/OAuthAuthorizationCode
                 (cond-> {:code         code
                          :user_id      (parse-user-id-or-throw user-id)
@@ -159,7 +173,8 @@
 
   (get-authorization-code [_ code]
     (-> (t2/select-one :model/OAuthAuthorizationCode :code code)
-        db-row->auth-code))
+        db-row->auth-code
+        checked-grant))
 
   (delete-authorization-code [_ code]
     (t2/delete! :model/OAuthAuthorizationCode :code code)
@@ -168,6 +183,7 @@
   (consume-authorization-code [_ code]
     (t2/with-transaction [_conn]
       (when-let [row (t2/select-one :model/OAuthAuthorizationCode :code code {:for :update})]
+        (checked-grant (db-row->auth-code row))
         (t2/delete! :model/OAuthAuthorizationCode :code code)
         (db-row->auth-code row)))))
 
@@ -176,6 +192,7 @@
 (defrecord DbTokenStore []
   proto/TokenStore
   (save-access-token [_ token user-id client-id scope expiry resource]
+    (checked-grant {:user-id user-id :client-id client-id :scope scope :resource resource})
     (t2/insert! :model/OAuthAccessToken
                 (cond-> {:token     token
                          :user_id   (parse-user-id user-id)
@@ -190,6 +207,7 @@
         db-row->access-token))
 
   (save-refresh-token [_ token user-id client-id scope expiry resource]
+    (checked-grant {:user-id user-id :client-id client-id :scope scope :resource resource})
     (t2/insert! :model/OAuthRefreshToken
                 (cond-> {:token     token
                          :user_id   (parse-user-id user-id)

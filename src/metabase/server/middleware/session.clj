@@ -371,10 +371,24 @@
   `:token-scopes` (the access it was granted); precedence is session > API key > bearer > MCP UI credential."
   [handler]
   (fn [request respond raise]
-    (let [request' (tracing/with-span :db-app "db-app.session-lookup" {}
-                     (merge-current-user-info request))]
-      (analytics/with-auth-method! (:embedding/auth-method request')
-        (handler request' respond raise)))))
+    ;; This check must precede session/API-key precedence. An invalid or retired pilot
+    ;; Bearer must not gain broader authority from a cookie supplied alongside it.
+    (let [auth-header (get-in request [:headers "authorization"])
+          bearer? (and (string? auth-header) (re-find #"(?i)^Bearer(?:\s|$)" auth-header))
+          pilot-config (when bearer? (mcp/pilot-configuration))
+          error (when (and bearer? (not= :off (:mode pilot-config)))
+                  (mcp/pilot-bearer-request-error
+                   pilot-config
+                   (oauth-server/access-token-client-id (oauth-server/extract-bearer-token request))
+                   (:uri request)
+                   (boolean (or (:metabase-session-key request) (get-in request [:headers "x-api-key"])))))]
+      (if error
+        (respond {:status (:status error) :headers {"Content-Type" "application/json" "Cache-Control" "no-store"}
+                  :body {:message (:message error)}})
+        (let [request' (tracing/with-span :db-app "db-app.session-lookup" {}
+                         (merge-current-user-info request))]
+          (analytics/with-auth-method! (:embedding/auth-method request')
+            (handler request' respond raise)))))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                               bind-current-user                                                |

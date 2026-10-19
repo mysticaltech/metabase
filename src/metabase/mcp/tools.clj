@@ -9,6 +9,8 @@
    [metabase.api.common :as api]
    [metabase.api.macros.defendpoint.tools-manifest :as tools-manifest]
    [metabase.config.core :as config]
+   [metabase.mcp.pilot-auth :as pilot.auth]
+   [metabase.mcp.pilot-tools :as pilot.tools]
    [metabase.mcp.resources :as mcp.resources]
    [metabase.mcp.scope :as mcp.scope]
    [metabase.mcp.session :as mcp.session]
@@ -182,11 +184,11 @@
     (str tool-name " requires a client that supports " extension-names ". "
          "Reconnect from a client that advertises text/html;profile=mcp-app.")))
 
-(defn list-tools
+(defn- list-native-tools
   "Return the tool definitions suitable for MCP `tools/list` responses.
    When `token-scopes` is provided, only tools whose scope matches are included."
   ([token-scopes]
-   (list-tools token-scopes {:supports-mcp-ui? true}))
+   (list-native-tools token-scopes {:supports-mcp-ui? true}))
   ([token-scopes options]
    (let [{:keys [tools]} (manifest)
          supported       (supported-extensions options)]
@@ -196,6 +198,14 @@
                  (map (fn [tool]
                         (select-keys tool [:name :title :description :inputSchema :outputSchema :annotations :_meta]))))
            (concat tools (mcp.resources/list-ui-tools))))))
+
+(defn list-tools
+  "List native tools under the caller's scopes and any configured pilot policy."
+  ([token-scopes] (list-tools token-scopes {:supports-mcp-ui? true}))
+  ([token-scopes options]
+   (if (pilot.auth/restricted-request?)
+     (pilot.tools/list-tools token-scopes #(list-native-tools token-scopes options))
+     (list-native-tools token-scopes options))))
 
 (defn- pad-left
   [^String s width]
@@ -362,7 +372,9 @@
    This buffers the full response in memory (~120KB for 200 rows), which is fine for
    the row limits we enforce."
   [^StreamingResponse response]
-  (let [baos         (ByteArrayOutputStream.)
+  (let [baos         (if (pilot.auth/restricted-request?)
+                       (pilot.tools/limited-buffer pilot.tools/raw-response-limit)
+                       (ByteArrayOutputStream.))
         canceled-chan (a/promise-chan)
         f            (.f response)]
     (f baos canceled-chan)
@@ -485,7 +497,7 @@
   (when arguments
     (into {} (remove (comp nil? val)) arguments)))
 
-(defn call-tool
+(defn- call-native-tool
   "Dispatch an MCP `tools/call` request to the appropriate handler.
    `token-scopes` from the original MCP session are propagated to the synthetic
    agent-api request so that scope restrictions are enforced by the agent API's
@@ -493,7 +505,7 @@
    as opts in case a tool needs to scope reads to the calling MCP session.
    Returns MCP content on success, or error content on failure."
   ([token-scopes session-id tool-name arguments]
-   (call-tool token-scopes session-id tool-name arguments {:supports-mcp-ui? true}))
+   (call-native-tool token-scopes session-id tool-name arguments {:supports-mcp-ui? true}))
   ([token-scopes session-id tool-name arguments options]
    (let [arguments (drop-nil-args arguments)
          supported (supported-extensions options)]
@@ -518,3 +530,13 @@
                    (catch Exception e
                      (error-content (or (ex-message e) "Internal error"))))))))
          (error-content (str "Unknown tool: " tool-name)))))))
+
+(defn call-tool
+  "Call native tools, enforcing the pilot contract before nil removal, handles, UI or dispatch."
+  ([token-scopes session-id tool-name arguments]
+   (call-tool token-scopes session-id tool-name arguments {:supports-mcp-ui? true}))
+  ([token-scopes session-id tool-name arguments options]
+   (if (pilot.auth/restricted-request?)
+     (pilot.tools/call-tool token-scopes tool-name arguments
+                            #(call-native-tool token-scopes session-id tool-name arguments options))
+     (call-native-tool token-scopes session-id tool-name arguments options))))

@@ -10,6 +10,9 @@
    [metabase.api.macros.scope :as scope]
    [metabase.api.open-api :as open-api]
    [metabase.mcp.core :as mcp]
+   [metabase.mcp.pilot-auth :as pilot.auth]
+   [metabase.mcp.pilot-config :as pilot.config]
+   [metabase.mcp.pilot-policy :as pilot.policy]
    [metabase.mcp.resources :as mcp.resources]
    [metabase.mcp.session :as mcp.session]
    [metabase.mcp.tools :as mcp.tools]
@@ -52,12 +55,13 @@
   {:jsonrpc "2.0" :id id :error {:code code :message message}})
 
 (defn- handle-initialize [id params]
-  (when-let [client-info (:clientInfo params)]
-    (log/infof "MCP client connected: %s %s" (:name client-info) (:version client-info)))
+  (when-not (pilot.auth/restricted-request?)
+    (when-let [client-info (:clientInfo params)]
+      (log/infof "MCP client connected: %s %s" (:name client-info) (:version client-info))))
   (jsonrpc-response
    id
    {:protocolVersion protocol-version
-    :capabilities    {:tools {:listChanged true} :resources {}}
+    :capabilities    (if (pilot.auth/restricted-request?) {:tools {}} {:tools {:listChanged true} :resources {}})
     :serverInfo      server-info}))
 
 (defn- mcp-app-ui-capability?
@@ -100,23 +104,30 @@
 (defn- handle-ping [id _params]
   (jsonrpc-response id {}))
 
+(declare pilot-message-valid?)
+
 (defn- dispatch-request
   "Dispatch a single JSON-RPC request. Returns a response map or nil for notifications."
   [{:keys [id method params] :as _msg} session-id token-scopes]
   (try
-    (case method
-      "notifications/initialized" nil
-      "tools/list"                (handle-tools-list id params session-id token-scopes)
-      "tools/call"                (handle-tools-call id params session-id token-scopes)
-      "resources/list"            (handle-resources-list id params token-scopes)
-      "resources/read"            (handle-resources-read id params token-scopes)
-      "ping"                      (handle-ping id params)
-      (if id
-        (jsonrpc-error id -32601 (str "Method not found: " method))
-        nil))
+    (if (and (pilot.auth/restricted-request?) (not (pilot-message-valid? _msg)))
+      (jsonrpc-error id -32600 "Request unavailable for this MCP profile.")
+      (case method
+        "notifications/initialized" nil
+        "tools/list"                (handle-tools-list id params session-id token-scopes)
+        "tools/call"                (handle-tools-call id params session-id token-scopes)
+        "resources/list"            (handle-resources-list id params token-scopes)
+        "resources/read"            (handle-resources-read id params token-scopes)
+        "ping"                      (handle-ping id params)
+        (if id
+          (jsonrpc-error id -32601 (str "Method not found: " method))
+          nil)))
     (catch Throwable e
-      (log/error "Error dispatching JSON-RPC method" method (ex-message e))
-      (jsonrpc-error id -32603 (or (ex-message e) "Internal error")))))
+      (if (pilot.auth/restricted-request?)
+        (jsonrpc-error id -32603 "Approved report unavailable.")
+        (do
+          (log/error "Error dispatching JSON-RPC method" method (ex-message e))
+          (jsonrpc-error id -32603 (or (ex-message e) "Internal error")))))))
 
 ;;; ----------------------------------------------------- SSE ------------------------------------------------------
 
@@ -210,6 +221,21 @@
 
 ;;; -------------------------------------------------- Handlers ---------------------------------------------------
 
+(defn- pilot-message-valid? [{:keys [jsonrpc method params] :as body}]
+  (and (map? body) (= jsonrpc "2.0")
+       (let [id (:id body)]
+         (or (nil? id) (and (integer? id) (<= Long/MIN_VALUE id Long/MAX_VALUE))
+             (and (string? id) (<= (count id) 64))))
+       (every? #{:jsonrpc :id :method :params} (keys body))
+       (case method
+         "initialize" (and (map? params)
+                           (every? #{:protocolVersion :capabilities :clientInfo} (keys params))
+                           (string? (:protocolVersion params))
+                           (map? (:capabilities params)) (map? (:clientInfo params)))
+         "tools/call" (and (map? params) (= (set (keys params)) #{:name :arguments}))
+         ("tools/list" "resources/list" "ping" "notifications/initialized") (or (nil? params) (= {} params))
+         false)))
+
 (defn- handle-post
   "Handle a POST request containing one or more JSON-RPC messages."
   [user-id request]
@@ -217,6 +243,10 @@
         session-id (get-in request [:headers "mcp-session-id"])
         batch?     (sequential? body)]
     (cond
+      (and (pilot.auth/restricted-request?)
+           (or batch? (not (pilot-message-valid? body))))
+      (json-response 400 (jsonrpc-error nil -32600 "Request unavailable for this MCP profile."))
+
       (nil? body)
       (json-response 400 (jsonrpc-error nil -32700 "Parse error: empty body"))
 
@@ -234,7 +264,7 @@
       ;; Initialize: create session and return response with session header
       (and (not batch?) (= "initialize" (:method body)))
       (let [params           (:params body)
-            supports-mcp-ui? (mcp-app-ui-capability? params)
+            supports-mcp-ui? (and (not (pilot.auth/restricted-request?)) (mcp-app-ui-capability? params))
             session-id       (mcp.session/create! user-id {:supports-mcp-ui?
                                                            supports-mcp-ui?})
             init-response (handle-initialize (:id body) (:params body))]
@@ -363,7 +393,8 @@
      (let [origin-error (validate-origin request)
            bearer-token (oauth-server/extract-bearer-token request)
            session-auth api/*current-user-id*
-           token-scopes (:token-scopes request)]
+           token-scopes (:token-scopes request)
+           pilot-config (pilot.config/current)]
        (letfn [(dispatch [user-id token-scopes]
                  (request/with-current-user user-id
                    (if-let [throttle-err (check-throttle user-id)]
@@ -372,21 +403,85 @@
                        (let [request (assoc request :token-scopes token-scopes)]
                          (cond
                            (= :post (:request-method request))
-                           (respond (handle-post user-id request))
+                           (let [response (handle-post user-id request)]
+                             (when pilot.auth/*authorization* (pilot.auth/ensure-authorized!))
+                             (respond response))
 
                            (= :get (:request-method request))
                            (handle-get user-id request respond raise)
 
                            (= :delete (:request-method request))
-                           (respond (handle-delete user-id request))
+                           (let [response (handle-delete user-id request)]
+                             (when pilot.auth/*authorization* (pilot.auth/ensure-authorized!))
+                             (respond response))
 
                            :else
                            (respond (json-response 405 (jsonrpc-error nil -32600 "Method not allowed")))))
                        (catch Throwable e
-                         (raise e))))))]
+                         (if (pilot.auth/restricted-request?)
+                           (let [unavailable? (= 503 (:status-code (ex-data e)))]
+                             (respond (json-response (if unavailable? 503 403)
+                                                     (jsonrpc-error nil -32603
+                                                                    (if unavailable? "MCP pilot configuration unavailable."
+                                                                        "MCP pilot authorization unavailable.")))))
+                           (raise e)))))))]
          (cond
            (some? origin-error)
            (respond origin-error)
+
+           ;; Configured pilot mode never accepts session/API-key authority, including
+           ;; superusers. All aliases and suffixes reaching this handler are checked.
+           (pilot.config/configured? pilot-config)
+           (cond
+             (not= :active (:mode pilot-config))
+             (respond (json-response 503 (jsonrpc-error nil -32603 "MCP pilot configuration unavailable.")))
+
+             (not (pilot.policy/mcp-path? (:uri request)))
+             (respond (json-response 403 (jsonrpc-error nil -32603 "MCP pilot authorization unavailable.")))
+
+             (not (seq bearer-token))
+             (respond (json-response 401 (jsonrpc-error nil -32603 "OAuth authentication required.")
+                                     {"WWW-Authenticate" (www-authenticate-discovery request)}))
+
+             (or (:metabase-session-key request)
+                 (get-in request [:headers "x-metabase-session"])
+                 (get-in request [:headers "x-api-key"]))
+             (respond (json-response 403 (jsonrpc-error nil -32603 "MCP pilot authorization unavailable.")))
+
+             (= :get (:request-method request))
+             (respond (json-response 405 (jsonrpc-error nil -32600 "Method not allowed")))
+
+             :else
+             (try
+               (if-let [grant (oauth-server/resolve-access-token-details bearer-token)]
+                 (do
+                   (pilot.auth/authorize-mcp! pilot-config grant)
+                   (if (= :head (:request-method request))
+                     (if (= "/api/metabase-mcp" (:uri request))
+                       (do
+                         ;; This adjunct attests admission only. The forwarded MCP request
+                         ;; must independently repeat authorization and report/output checks.
+                         (pilot.auth/authorize-mcp! pilot-config
+                                                    (oauth-server/resolve-access-token-details bearer-token))
+                         (respond {:status 204 :body ""
+                                   :headers {"Cache-Control" "no-store"
+                                             "X-Metabase-MCP-Pilot-Proof" "1"
+                                             "X-Metabase-MCP-Pilot-Digest"
+                                             (pilot.policy/fingerprint
+                                              {:client-ids (sort (:client-ids pilot-config))
+                                               :policy (:policy pilot-config)})}}))
+                       (respond (json-response 405 (jsonrpc-error nil -32600 "Method not allowed"))))
+                     (binding [pilot.auth/*authorization*
+                               {:config pilot-config
+                                :resolve-grant #(oauth-server/resolve-access-token-details bearer-token)}]
+                       (dispatch (:user-id grant) (:scopes grant)))))
+                 (respond (json-response 401 (jsonrpc-error nil -32603 "Bearer authentication unavailable."))))
+               (catch Exception e
+                 (let [status (if (= 503 (:status-code (ex-data e))) 503 403)]
+                   (respond (json-response status
+                                           (jsonrpc-error nil -32603
+                                                          (if (= status 503) "MCP pilot configuration unavailable."
+                                                              "MCP pilot authorization unavailable."))))))))
 
            ;; Respect the scope set attached to an authenticated request. Sessions without one
            ;; retain unrestricted access.

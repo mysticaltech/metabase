@@ -87,9 +87,9 @@
     (when (str/starts-with? (u/lower-case-en auth) "bearer ")
       (str/trim (subs auth 7)))))
 
-(defn resolve-access-token
+(defn resolve-access-token-details
   "Validate an OAuth bearer access token string against the token store. Returns
-   `{:user-id <int> :scopes <set-of-strings>}` on success, or nil on failure (unknown,
+   User, client, resource, original grant and scopes on success, or nil on failure (unknown,
    expired, or revoked token, or a token with no associated user).
 
    This is the single token-resolution lookup shared by the MCP transport and the core
@@ -99,9 +99,43 @@
   (when (seq token-string)
     (when-let [provider (get-provider)]
       (when-let [token-data (oidc.store/get-access-token (:token-store provider) token-string)]
+        (mcp/validate-pilot-grant! token-data)
         (let [expiry (:expiry token-data)]
           (when (or (nil? expiry)
                     (t/after? (t/instant expiry) (t/instant)))
             (when-let [user-id (some-> (:user-id token-data) parse-long)]
-              {:user-id user-id
-               :scopes  (or (some->> (:scope token-data) (into #{})) #{})})))))))
+              (assoc token-data :user-id user-id
+                     :scopes (or (some->> (:scope token-data) (into #{})) #{})))))))))
+
+(defn resolve-access-token
+  "Resolve native OAuth identity/scopes with the original public return shape."
+  [token-string]
+  (some-> (resolve-access-token-details token-string) (select-keys [:user-id :scopes])))
+
+(defn access-token-client-id
+  "Read only the issuing client identity for pre-fallback route enforcement, including revoked tokens."
+  [token-string]
+  (store/access-token-client-id token-string))
+
+(defn validate-pilot-authorization!
+  "Check a parsed native authorization request before consent or code issuance."
+  [parsed user-id]
+  (mcp/validate-pilot-grant! {:client-id (:client_id parsed)
+                              :user-id user-id
+                              :scope (when-let [s (:scope parsed)] (str/split s #" "))
+                              :resource (:resource parsed)}))
+
+(defn validate-pilot-token-request!
+  "Validate the original native grant before redemption or refresh, without blocking RFC 7009 lookup."
+  [provider body]
+  (mcp/validate-pilot-token-client! (:client_id body))
+  (let [grant (case (:grant_type body)
+                "authorization_code" (when-let [code (:code body)]
+                                       (oidc.store/get-authorization-code (:code-store provider) code))
+                "refresh_token" (when-let [token (:refresh_token body)]
+                                  (oidc.store/get-refresh-token (:token-store provider) token))
+                nil)]
+    ;; Missing/revoked codes and refresh tokens keep the provider's native error.
+    ;; Every actual token write remains guarded independently by the store.
+    (when grant
+      (mcp/validate-pilot-grant! grant))))
