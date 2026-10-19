@@ -89,6 +89,9 @@
 (deftest fixed-definition-survives-fresh-provider-and-json-reconstruction-test
   (let [metadata {:cards {17 api-card} :collections {4 api-collection} :snippets {}}
         pins (snapshot/pins-from-api fixtures/report metadata)]
+    (is (= "9e9cb16283a4318cc562b4cb0c19dc110981ec094c73ea579963059a56e43742" (:sha256 pins)))
+    (doseq [context fixtures/ambient-printer-contexts]
+      (is (= pins (with-bindings context (snapshot/pins-from-api fixtures/report metadata)))))
     (dotimes [_ 3]
       (let [query (assoc (:dataset_query api-card) :lib/metadata
                          (lib.metadata.jvm/application-database-metadata-provider 7))

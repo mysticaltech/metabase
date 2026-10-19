@@ -5,6 +5,48 @@
 
 (set! *warn-on-reflection* true)
 
+(def bootstrap-printer-context
+  {#'*print-namespace-maps* true #'*print-length* nil #'*print-level* nil
+   #'*print-meta* false #'*print-dup* false #'*print-readably* true})
+
+(def ambient-printer-contexts
+  [{#'*print-namespace-maps* false}
+   {#'*print-length* 1}
+   {#'*print-level* 1}
+   {#'*print-meta* true}
+   {#'*print-dup* true}
+   {#'*print-readably* false}
+   {#'*print-namespace-maps* false #'*print-length* 1 #'*print-level* 1
+    #'*print-meta* true #'*print-dup* true #'*print-readably* false}])
+
+(deftest namespace-map-fingerprint-context-regression-test
+  (let [snapshot {:result_metadata [{:name "invented" :fingerprint {:type {:type/Number {:min 1 :max 2}}}}]}
+        expected (with-bindings bootstrap-printer-context (pilot/fingerprint snapshot))]
+    (is (= expected (binding [*print-namespace-maps* false] (pilot/fingerprint snapshot))))))
+
+(deftest fingerprint-freezes-ordering-and-serialization-context-test
+  (let [snapshot {:result_metadata [{:name "invented\n\"quoted\""
+                                     :fingerprint {:type {:type/Number {:min 1 :max 2}}}}]
+                  :ordering {(with-meta [:type/Number :a] {:printer "ignored"}) 1
+                             [:type/Number :b] 2}
+                  :members #{{:type/Number {:min 1}} {:type/Number {:min 2}}}}
+        expected (with-bindings bootstrap-printer-context (pilot/fingerprint snapshot))]
+    (doseq [context ambient-printer-contexts]
+      (let [actual (with-bindings context (pilot/fingerprint snapshot))
+            drift (with-bindings context (pilot/fingerprint (assoc-in snapshot [:ordering [:type/Number :b]] 3)))]
+        (is (= expected actual))
+        (is (not= expected drift))))))
+
+(deftest fingerprint-context-does-not-coerce-or-skip-values-test
+  (doseq [context (cons bootstrap-printer-context ambient-printer-contexts)]
+    (let [digests (with-bindings context
+                    (mapv #(pilot/fingerprint {:value %}) [1 1.0 1M 1/2]))]
+      (is (= 4 (count (distinct digests)))))
+    (doseq [unsupported [(Object.) (java.time.LocalDate/of 2024 2 29) (random-uuid) identity]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unavailable"
+                            (with-bindings context
+                              (pilot/fingerprint {:nested [{:value unsupported}]})))))))
+
 (def report
   {:id 17
    :title "Invented website totals"

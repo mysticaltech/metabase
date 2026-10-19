@@ -183,14 +183,21 @@
 (defn fingerprint
   "SHA-256 of a deterministic EDN representation of an in-process query snapshot."
   [snapshot]
-  (letfn [(canonical [x]
-            (cond
-              (map? x) (into (sorted-map-by #(compare (pr-str %1) (pr-str %2)))
-                             (map (fn [[k v]] [k (canonical v)])) x)
-              (set? x) (sort-by pr-str (map canonical x))
-              (sequential? x) (mapv canonical x)
-              (or (nil? x) (boolean? x) (string? x) (keyword? x) (number? x)) x
-              :else (unavailable!)))]
-    (let [bytes (.digest (MessageDigest/getInstance "SHA-256")
-                         (.getBytes (pr-str (canonical snapshot)) StandardCharsets/UTF_8))]
-      (str/join (map #(format "%02x" (bit-and 0xff %)) bytes)))))
+  ;; Reviewed bootstrap pins use this printer context, including canonical ordering comparisons.
+  (binding [*print-namespace-maps* true
+            *print-length* nil
+            *print-level* nil
+            *print-meta* false
+            *print-dup* false
+            *print-readably* true]
+    (letfn [(canonical [x]
+              (cond
+                (map? x) (into (sorted-map-by #(compare (pr-str %1) (pr-str %2)))
+                               (map (fn [[k v]] [k (canonical v)])) x)
+                (set? x) (sort-by pr-str (map canonical x))
+                (sequential? x) (mapv canonical x)
+                (or (nil? x) (boolean? x) (string? x) (keyword? x) (number? x)) x
+                :else (unavailable!)))]
+      (let [bytes (.digest (MessageDigest/getInstance "SHA-256")
+                           (.getBytes (pr-str (canonical snapshot)) StandardCharsets/UTF_8))]
+        (str/join (map #(format "%02x" (bit-and 0xff %)) bytes))))))

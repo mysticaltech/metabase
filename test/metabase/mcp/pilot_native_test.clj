@@ -421,7 +421,7 @@
                                                       [id (api-json 'metabase.collections-rest.api id)]))
                               :snippets {}}
                     before (snapshot/capture! report)
-                    pins (snapshot/pins-from-api report metadata)
+                    pins (binding [*print-namespace-maps* true] (snapshot/pins-from-api report metadata))
                     p (assoc policy :reports [(merge report pins)])
                     validate! snapshot/validate!
                     oauth-snapshots (atom [])]
@@ -444,15 +444,16 @@
                                 (let [captured (validate! pinned-report)]
                                   (swap! oauth-snapshots conj captured)
                                   captured))]
-                  (let [access (:access_token tokens)
-                        init (initialize! access "/api/metabase-mcp")
-                        session-id (get-in init [:headers "Mcp-Session-Id"])
-                        result (:result (decoded-body (call! access session-id {:id (:id root)})))]
-                    (is (= 200 (:status init)))
-                    (is (not (:isError result)))
-                    (is (= [["2024-03-01" 83]] (get-in result [:structuredContent :data :rows])))
-                    (is (= [before before] @oauth-snapshots))
-                    (is (= pins (snapshot/pins! report)))))))))))))
+                  (binding [*print-namespace-maps* false]
+                    (let [access (:access_token tokens)
+                          init (initialize! access "/api/metabase-mcp")
+                          session-id (get-in init [:headers "Mcp-Session-Id"])
+                          result (:result (decoded-body (call! access session-id {:id (:id root)})))]
+                      (is (= 200 (:status init)))
+                      (is (not (:isError result)))
+                      (is (= [["2024-03-01" 83]] (get-in result [:structuredContent :data :rows])))
+                      (is (= [before before] @oauth-snapshots))
+                      (is (= pins (snapshot/pins! report))))))))))))))
 
 (defn- with-mutable-date-pilot! [f]
   (one-off-dbs/with-blank-db
