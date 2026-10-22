@@ -4,6 +4,7 @@
   (:require
    [clojure.string :as str]
    [metabase.api.macros :as api.macros]
+   [metabase.mcp.native-access :as native.access]
    [metabase.mcp.pilot-auth :as pilot.auth]
    [metabase.mcp.pilot-config :as pilot.config]
    [metabase.mcp.resources :as mcp.resources]
@@ -20,6 +21,7 @@
 (defn validate-pilot-grant!
   "Apply the configured pilot ceiling to a stored or proposed native OAuth grant."
   [grant]
+  (native.access/validate-grant! grant)
   (pilot.auth/validate-grant! grant))
 
 (defn validate-pilot-token-client!
@@ -45,7 +47,8 @@
 (defn resolve-ui-credential
   "Resolves a credential issued for an MCP UI resource."
   [credential]
-  (mcp.session/resolve-ui-credential credential))
+  (when-let [claims (mcp.session/resolve-ui-credential credential)]
+    (when (native.access/ui-user-allowed? (:uid claims)) claims)))
 
 (defn vscode-webview-enabled?
   "Returns true if vscode/cursor is enabled in common MCP apps."

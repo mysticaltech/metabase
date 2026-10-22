@@ -10,6 +10,7 @@
    [metabase.api.macros.scope :as scope]
    [metabase.api.open-api :as open-api]
    [metabase.mcp.core :as mcp]
+   [metabase.mcp.native-access :as native.access]
    [metabase.mcp.pilot-auth :as pilot.auth]
    [metabase.mcp.pilot-config :as pilot.config]
    [metabase.mcp.pilot-policy :as pilot.policy]
@@ -394,7 +395,8 @@
            bearer-token (oauth-server/extract-bearer-token request)
            session-auth api/*current-user-id*
            token-scopes (:token-scopes request)
-           pilot-config (pilot.config/current)]
+           pilot-config (pilot.config/current)
+           native-access (native.access/current)]
        (letfn [(dispatch [user-id token-scopes]
                  (request/with-current-user user-id
                    (if-let [throttle-err (check-throttle user-id)]
@@ -405,6 +407,8 @@
                            (= :post (:request-method request))
                            (let [response (handle-post user-id request)]
                              (when pilot.auth/*authorization* (pilot.auth/ensure-authorized!))
+                             (when (native.access/configured? native-access)
+                               (native.access/authorize! native-access (oauth-server/resolve-access-token-details bearer-token)))
                              (respond response))
 
                            (= :get (:request-method request))
@@ -413,21 +417,54 @@
                            (= :delete (:request-method request))
                            (let [response (handle-delete user-id request)]
                              (when pilot.auth/*authorization* (pilot.auth/ensure-authorized!))
+                             (when (native.access/configured? native-access)
+                               (native.access/authorize! native-access (oauth-server/resolve-access-token-details bearer-token)))
                              (respond response))
 
                            :else
                            (respond (json-response 405 (jsonrpc-error nil -32600 "Method not allowed")))))
                        (catch Throwable e
-                         (if (pilot.auth/restricted-request?)
+                         (if (or (pilot.auth/restricted-request?) (native.access/configured? native-access))
                            (let [unavailable? (= 503 (:status-code (ex-data e)))]
                              (respond (json-response (if unavailable? 503 403)
                                                      (jsonrpc-error nil -32603
-                                                                    (if unavailable? "MCP pilot configuration unavailable."
-                                                                        "MCP pilot authorization unavailable.")))))
+                                                                    (if (native.access/configured? native-access)
+                                                                      "Metabase MCP access unavailable."
+                                                                      (if unavailable? "MCP pilot configuration unavailable."
+                                                                          "MCP pilot authorization unavailable."))))))
                            (raise e)))))))]
          (cond
            (some? origin-error)
            (respond origin-error)
+
+           ;; This profile admits accounts only. Full native dispatch and role checks remain unchanged.
+           (native.access/configured? native-access)
+           (cond
+             (not= :active (:mode native-access))
+             (respond (json-response 503 (jsonrpc-error nil -32603 "Metabase MCP access configuration unavailable.")))
+
+             (not= "/api/metabase-mcp" (:uri request))
+             (respond (json-response 403 (jsonrpc-error nil -32603 "Metabase MCP access unavailable.")))
+
+             (not (seq bearer-token))
+             (respond (json-response 401 (jsonrpc-error nil -32603 "OAuth authentication required.")
+                                     {"WWW-Authenticate" (www-authenticate-discovery request)}))
+
+             (or (:metabase-session-key request)
+                 (get-in request [:headers "x-metabase-session"])
+                 (get-in request [:headers "x-api-key"]))
+             (respond (json-response 403 (jsonrpc-error nil -32603 "Metabase MCP access unavailable.")))
+
+             :else
+             (try
+               (if-let [grant (oauth-server/resolve-access-token-details bearer-token)]
+                 (do
+                   (native.access/authorize! native-access grant)
+                   (dispatch (:user-id grant) (:scopes grant)))
+                 (respond (json-response 401 (jsonrpc-error nil -32603 "Bearer authentication unavailable."))))
+               (catch Exception e
+                 (let [status (if (= 503 (:status-code (ex-data e))) 503 403)]
+                   (respond (json-response status (jsonrpc-error nil -32603 "Metabase MCP access unavailable.")))))))
 
            ;; Configured pilot mode never accepts session/API-key authority, including
            ;; superusers. All aliases and suffixes reaching this handler are checked.
