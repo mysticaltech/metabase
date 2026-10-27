@@ -322,6 +322,20 @@
   ;; becomes available
   false)
 
+(defenterprise sandboxed-user-for-db?
+  "Whether the current user has an enforced sandbox in this database. OSS has no sandboxes."
+  metabase-enterprise.sandbox.api.util
+  [_database-id]
+  (when-not api/*current-user-id*
+    (throw (ex-info (str (tru "No current user found")) {:status-code 403})))
+  false)
+
+(defenterprise row-restricted-by-routing?
+  "Whether routing sends this user to a destination database, using the existing v63 routing predicate."
+  metabase-enterprise.database-routing.common
+  [_database-id]
+  false)
+
 (defenterprise impersonated-user?
   "Returns a boolean if the current user uses connection impersonation for any database. In OSS this is always false.
   Will throw an error if [[api/*current-user-id*]] is not bound."

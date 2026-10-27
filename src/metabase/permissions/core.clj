@@ -135,6 +135,8 @@
   log-permissions-changes
   sandboxed-or-impersonated-user?
   sandboxed-user?
+  sandboxed-user-for-db?
+  row-restricted-by-routing?
   increment-implicit-perms-revision!
   save-perms-revision!]
  [metabase.permissions.validation
