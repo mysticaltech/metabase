@@ -761,6 +761,15 @@
            (some? origin-error)
            (respond origin-error)
 
+           ;; Preserve the deployed OAuth-only machine boundary across the v2 upgrade. Although the session
+           ;; middleware ignores these credentials here, refuse an ambiguous bearer-plus-session/API-key request
+           ;; rather than silently selecting one identity. Browser and non-MCP authentication are unchanged.
+           (and (seq bearer-token)
+                (or (:metabase-session-key request)
+                    (get-in request [:headers "x-metabase-session"])
+                    (get-in request [:headers "x-api-key"])))
+           (respond (json-response 403 (jsonrpc-error nil -32603 (message/msg ["Mixed authentication methods are not accepted."]))))
+
            ;; An OAuth token holding none of this surface's scopes was not issued for this server, e.g. a REST token,
            ;; so the MCP auth spec requires `invalid_token`. A token without scopes falls here too.
            (and (:authenticated-via-oauth? request) (not-any? accepted-scopes token-scopes))

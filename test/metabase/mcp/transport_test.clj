@@ -615,6 +615,26 @@
                #(deliver result %)))
     (deref result 10000 ::timeout)))
 
+(deftest mixed-authentication-is-refused-before-mcp-session-creation-test
+  (testing "the deployed OAuth-only boundary still rejects bearer plus another identity after the v2 rebase"
+    (mt/with-temporary-setting-values [site-url "http://localhost:3000"]
+      (let [initialize {"jsonrpc" "2.0" "id" 1 "method" "initialize" "params" {"capabilities" {}}}
+            request    {:authenticated-via-oauth? true
+                        :token-scopes #{"agent:test"}
+                        :headers {"authorization" "Bearer invented-transport-token"}}]
+        (doseq [extra [{:metabase-session-key "invented-session"}
+                       {:headers {"x-metabase-session" "invented-session"}}
+                       {:headers {"x-api-key" "invented-api-key"}}]]
+          (let [response (invoke-transport (mt/user->id :rasta)
+                                           (-> (merge request extra)
+                                               (assoc :headers (merge (:headers request) (:headers extra))))
+                                           initialize)]
+            (is (= 403 (:status response)))
+            (is (nil? (get-in response [:headers "Mcp-Session-Id"])))
+            (is (str/includes? (:body response) "Mixed authentication methods are not accepted."))))
+        (testing "a bearer-only request still reaches the unchanged native handler"
+          (is (= 200 (:status (invoke-transport (mt/user->id :rasta) request initialize)))))))))
+
 (deftest oauth-request-without-token-scopes-is-refused-by-the-transport-test
   (testing "GHY-4542: defense in depth behind the session middleware. A request authenticated via OAuth but carrying
             no `:token-scopes` is refused with the invalid_token 401 rather than dispatched as unrestricted."
