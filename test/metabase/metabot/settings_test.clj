@@ -567,6 +567,15 @@
         (mt/with-temporary-setting-values [llm-mini-model nil]
           (is (= "anthropic/claude-haiku-4-5-20251001" (metabot.settings/llm-mini-model))))))))
 
+(deftest gpt-6-1-sol-explicit-main-and-background-model-test
+  (with-connections [(connection "openai" "openai" {:api-key "sk-openai" :mini-model "gpt-5.4-mini"})]
+    (with-selected-model "openai/gpt-6.1-sol"
+      (mt/with-temp-env-var-value! [mb-llm-mini-model nil]
+        (mt/with-temporary-raw-setting-values [llm-mini-model "openai/gpt-6.1-sol"]
+          (is (= "openai/gpt-6.1-sol" (metabot.settings/llm-metabot-provider)))
+          (is (= "openai/gpt-6.1-sol" (metabot.settings/explicit-mini-model)))
+          (is (= "openai/gpt-6.1-sol" (metabot.settings/llm-mini-model))))))))
+
 (deftest retired-model-reads-as-its-successor-test
   (testing "a saved retired OpenRouter id reads as the model now serving it, so the admin picker shows it selected"
     (with-connections [(connection "openrouter" "openrouter" {:api-key "sk-or-v1-test"})]

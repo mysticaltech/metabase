@@ -419,7 +419,7 @@
 
 (deftest ^:parallel supported-models-test
   (testing "whitelisted models are supported"
-    (doseq [id ["gpt-6-astra" "gpt-6-sol" "gpt-5.6-sol" "gpt-5.6-terra" "gpt-5.6-luna" "gpt-5.5" "gpt-5.4-mini"]]
+    (doseq [id ["gpt-6.1-sol" "gpt-6-astra" "gpt-6-sol" "gpt-5.6-sol" "gpt-5.6-terra" "gpt-5.6-luna" "gpt-5.5" "gpt-5.4-mini"]]
       (is (contains? openai/supported-models id) id)))
   (testing "non-white-listed models are not supported"
     (doseq [id ["gpt-5" "gpt-4.1" "gpt-4.1-mini" "gpt-4o" "o3" "text-embedding-3-small"]]
@@ -567,6 +567,48 @@
                                           :schema schema
                                           :temperature 0.3
                                           :max-tokens 128}))))))
+
+(deftest ^:parallel gpt-6-1-sol-responses-request-test
+  (testing "GPT-6.1 Sol preserves the exact requested model and Responses tool contract"
+    (let [schema {:type "object" :properties {:answer {:type "string"}} :required ["answer"]}]
+      (is (= {:model             "gpt-6.1-sol"
+              :stream            true
+              :store             false
+              :instructions      "Answer with the tool."
+              :input             [{:role "user" :content "Hello"}]
+              :tool_choice       "required"
+              :tools             [{:type "function"
+                                   :name "structured_output"
+                                   :description "Output structured data"
+                                   :parameters schema}]
+              :max_output_tokens 128
+              :reasoning         {:summary "auto"}
+              :include           ["reasoning.encrypted_content"]}
+             (openai/openai-request-body {:model "gpt-6.1-sol"
+                                          :system "Answer with the tool."
+                                          :input [{:role :user :content "Hello"}]
+                                          :schema schema
+                                          :temperature 0.3
+                                          :max-tokens 128})))
+      (is (= 922000 (openai/context-window-tokens "gpt-6.1-sol"))))))
+
+(deftest gpt-6-1-sol-catalog-and-no-substitution-test
+  (testing "the exact model is shown only when the configured account actually lists it"
+    (with-redefs [http/request (fn [_] {:status 200 :body {:data [{:id "gpt-6.1-sol"}]}})]
+      (is (= {:models [{:id "gpt-6.1-sol" :display_name "GPT-6.1 Sol"}]}
+             (openai/list-models {:credentials byok-credentials}))))
+    (with-redefs [http/request (fn [_] {:status 200 :body {:data []}})]
+      (is (= {:models []} (openai/list-models {:credentials byok-credentials})))))
+  (testing "an unavailable requested model raises an error after one request, never selecting another model"
+    (let [calls (atom [])]
+      (with-redefs [http/request (fn [request]
+                                  (swap! calls conj (select-keys (json/decode+kw (:body request)) [:model]))
+                                  (throw (ex-info "synthetic model unavailable" {:status 404})))]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (openai/openai-raw {:model "gpt-6.1-sol"
+                                         :input [{:role :user :content "Hello"}]
+                                         :credentials byok-credentials}))))
+      (is (= [{:model "gpt-6.1-sol"}] @calls)))))
 
 (deftest openai-auth-preferences-test
   (mt/with-premium-features #{:metabase-ai-managed}
