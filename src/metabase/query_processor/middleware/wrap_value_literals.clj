@@ -346,14 +346,25 @@
     ;; do not match inner clauses
     _ nil))
 
+(defn- parse-temporal-wire-literal
+  "Parse any remaining standalone wire literal after field-aware comparison coercion has completed.
+  Running this in a separate pass preserves the field's type, report timezone and bucket decisions."
+  [clause]
+  (match/match-one clause
+    [:absolute-datetime opts (s :guard string?) unit]
+    [:absolute-datetime opts (u.date/parse s) unit]))
+
 (mu/defn wrap-value-literals :- ::lib.schema/query
   "Middleware that wraps ran value literals in `:value` (for integers, strings, etc.) or `:absolute-datetime` (for
   datetime strings, etc.) clauses which include info about the Field they are being compared to. This is done mostly
   to make it easier for drivers to write implementations that rely on multimethod dispatch (by clause name) -- they
   can dispatch directly off of these clauses."
   [query :- ::lib.schema/query]
-  (lib.walk/walk-clauses query (fn [query _path-type path clause]
-                                 (wrap-value-literals-in-clause query path clause))))
+  (-> query
+      (lib.walk/walk-clauses (fn [query _path-type path clause]
+                               (wrap-value-literals-in-clause query path clause)))
+      (lib.walk/walk-clauses (fn [_query _path-type _path clause]
+                               (parse-temporal-wire-literal clause)))))
 
 ;;;
 ;;; Tangentially-related nonsense not used by the middleware
@@ -399,4 +410,5 @@
                          [$mbql]
                          (fn [clause]
                            (wrap-value-literals-in-clause nil nil clause)))
-                        first)))))
+                        first
+                        (lib.walk/walk-clause parse-temporal-wire-literal))))))

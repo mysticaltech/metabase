@@ -101,13 +101,28 @@
                                 ["2026-07-01T12:34:56" (t/local-date-time "2026-07-01T12:34:56")]
                                 ["2026-07-01T12:34:56+02:00" (t/offset-date-time "2026-07-01T12:34:56+02:00")]]]
       (is (= [:absolute-datetime {:lib/uuid "stable"} temporal :day]
-             (#'qp.wrap-value-literals/wrap-value-literals-in-clause
-              nil nil [:absolute-datetime {:lib/uuid "stable"} literal :day])))))
+             (#'qp.wrap-value-literals/parse-temporal-wire-literal
+              [:absolute-datetime {:lib/uuid "stable"} literal :day])))))
   (testing "already parsed temporal values and unrelated strings are not coerced"
-    (is (nil? (#'qp.wrap-value-literals/wrap-value-literals-in-clause
-               nil nil [:absolute-datetime {} (t/local-date "2026-07-01") :day])))
-    (is (nil? (#'qp.wrap-value-literals/wrap-value-literals-in-clause
-               nil nil [:value {} "2026-07-01"])))))
+    (is (nil? (#'qp.wrap-value-literals/parse-temporal-wire-literal
+               [:absolute-datetime {} (t/local-date "2026-07-01") :day])))
+    (is (nil? (#'qp.wrap-value-literals/parse-temporal-wire-literal
+               [:value {} "2026-07-01"])))))
+
+(deftest ^:parallel standalone-temporal-expression-parsing-test
+  (testing "the public middleware parses leftover expression literals after preserving field-aware coercion"
+    (let [base (-> (lib.tu/venues-query)
+                   (lib/expression "probe" (lib/absolute-datetime "2026-07-01" :day)))]
+      (doseq [[literal temporal] [["2026" (t/local-date "2026-01-01")]
+                                  ["2026-07" (t/local-date "2026-07-01")]
+                                  ["2026-07-01" (t/local-date "2026-07-01")]
+                                  ["2026-07-01T12:34:56" (t/local-date-time "2026-07-01T12:34:56")]
+                                  ["2026-07-01T12:34:56+02:00" (t/offset-date-time "2026-07-01T12:34:56+02:00")]]]
+        (let [wire     (assoc-in base [:stages 0 :expressions 0 2] literal)
+              wrapped  (wrap-value-literals wire)
+              expected (assoc-in wire [:stages 0 :expressions 0 2] temporal)]
+          (is (= (:stages expected) (:stages wrapped)) "literal options and unit are preserved")
+          (is (= (:stages wrapped) (:stages (wrap-value-literals wrapped))) "parsing is idempotent"))))))
 
 (deftest ^:parallel wrap-datetime-literal-strings-test
   (is (= (:query
