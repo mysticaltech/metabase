@@ -137,9 +137,8 @@
 
 (deftest ^:parallel error-generating-pivot-queries-test
   (testing "An error thrown while generating the pivot sub-queries, i.e. before the QP proper (and its error-handling middleware) runs"
-    ;; the native path silently drops out-of-range pivot indexes rather than throwing, so parity would disagree here
-    (qp.pivot.test-util/without-pivot-parity-check
-     (let [query (assoc (test-query) :pivot-rows [0 1 2 3])]
+    ;; This v63 fork has one multi-query pivot path, so no native-path parity wrapper is needed.
+    (let [query (assoc (test-query) :pivot-rows [0 1 2 3])]
        (testing "is thrown as-is for a non-userland query"
          (is (thrown-with-msg?
               clojure.lang.ExceptionInfo
@@ -152,7 +151,7 @@
                     :error      #"Invalid pivot-rows: specified breakout at index 3, but we only have 3 breakouts"
                     :error_type :invalid-query
                     :json_query map?}
-                   (qp.pivot/run-pivot-query userland-query)))))))))
+                   (qp.pivot/run-pivot-query userland-query))))))))
 
 (deftest ^:parallel generate-queries-test
   (mt/test-drivers (qp.pivot.test-util/applicable-drivers)
