@@ -246,6 +246,28 @@
           "trustServerCertificate=false"
           "trustStore=/path/to/store;trustStorePassword=password;trustStoreType=pkcs12")))))
 
+(deftest ^:parallel dangerous-details-preflight-without-warehouse-test
+  (let [details {:host "localhost", :port 1, :db "invented-preflight", :user "unused", :password "unused"}]
+    (testing "the real can-connect? entrypoint refuses dangerous properties before attempting JDBC"
+      (doseq [option ["socketFactoryClass=bad.Factory"
+                      "socketFactoryConstructorArg=bad"
+                      "trustManagerClass=bad.TrustManager"
+                      "trustManagerConstructorArg=/etc/passwd"
+                      "accessTokenCallbackClass=bad.Callback"
+                      "socketfactoryclass=bad.Factory"
+                      "SOCKETFACTORYCLASS=bad.Factory"
+                      "socketFactoryClass=bad.Factory;socketFactoryConstructorArg=bad"
+                      "socketFactoryClass=bad.Factory;trustServerCertificate=false"
+                      "trustServerCertificate=false;socketFactoryClass=bad.Factory"]
+              candidate [(assoc details :additional-options option)
+                         (update details :host str ";" option)]]
+        (is (thrown-with-msg? java.lang.Exception #"Potentially dangerous keys in connection details"
+                              (driver/can-connect? :sqlserver candidate)))))
+    (testing "safe properties pass preflight, without claiming a live warehouse connection"
+      (doseq [option [nil "" " " "trustServerCertificate=false"
+                      "trustStore=/path/to/store;trustStorePassword=password;trustStoreType=pkcs12"]]
+        (is (nil? (driver/validate-db-details! :sqlserver (assoc details :additional-options option))))))))
+
 (deftest ^:parallel validate-db-details-inherits-shared-denylist-test
   (testing "SQL Server also inherits the shared SQL-JDBC denylist, not just its own keys"
     (doseq [opt ["socketFactory=evil.Factory"   ; shared list, distinct from sqlserver's socketFactoryClass
