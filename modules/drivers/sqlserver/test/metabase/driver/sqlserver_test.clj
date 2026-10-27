@@ -359,9 +359,11 @@
                       "socketFactoryClass=bad.Factory;socketFactoryConstructorArg=bad"
                       "socketFactoryClass=bad.Factory;trustServerCertificate=false"
                       "trustServerCertificate=false;socketFactoryClass=bad.Factory"]
-              candidate [(assoc details :additional-options option)
-                         (update details :host str ";" option)]]
-        (is (thrown-with-msg? java.lang.Exception #"Potentially dangerous keys in connection details"
+              [candidate expected-message] [[(assoc details :additional-options option)
+                                              #"^Potentially dangerous keys in additional options$"]
+                                             [(update details :host str ";" option)
+                                              #"^Potentially dangerous keys in connection details$"]]]
+        (is (thrown-with-msg? java.lang.Exception expected-message
                               (driver/can-connect? :sqlserver candidate)))))
     (testing "safe properties pass preflight, without claiming a live warehouse connection"
       (doseq [option [nil "" " " "trustServerCertificate=false"
