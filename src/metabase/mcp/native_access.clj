@@ -31,9 +31,15 @@
       {:mode :off}
       (try
         (let [ids (parse-users users)]
-          (if (and (= mode "two-accounts") ids
-                   (every? nil? (vals (pilot.config/inputs))))
-            {:mode :active :user-ids ids}
+          (if (every? nil? (vals (pilot.config/inputs)))
+            (cond
+              (and (= mode "native-users") (nil? users))
+              {:mode :active :audience :active-native-users}
+
+              (and (= mode "two-accounts") ids)
+              {:mode :active :user-ids ids}
+
+              :else {:mode :invalid})
             {:mode :invalid}))
         (catch Exception _ {:mode :invalid})))))
 
@@ -54,7 +60,8 @@
 
 (defn- active-allowed-user? [c id]
   (when-let [id (canonical-user-id id)]
-    (and (contains? (:user-ids c) id)
+    (and (or (= :active-native-users (:audience c))
+             (contains? (:user-ids c) id))
          (t2/exists? :model/User :id id :is_active true))))
 
 (defn authorize!
