@@ -23,6 +23,7 @@
    [metabase.query-processor.error-type :as qp.error-type]
    [metabase.query-processor.metadata :as qp.metadata]
    [metabase.query-processor.middleware.add-remaps :as qp.add-remaps]
+   [metabase.query-processor.middleware.catch-exceptions :as qp.catch-exceptions]
    [metabase.query-processor.middleware.drop-fields-in-summaries :as qp.drop-fields-in-summaries]
    [metabase.query-processor.middleware.normalize-query :as qp.middleware.normalize]
    [metabase.query-processor.pipeline :as qp.pipeline]
@@ -501,21 +502,11 @@
       (quot *pivot-max-result-rows* num-aggs)
       *pivot-max-result-rows*)))
 
-(mu/defn run-pivot-query
-  "Run the pivot query. You are expected to wrap this call in [[metabase.query-processor.streaming/streaming-response]]
-  yourself."
-  ([query]
-   (run-pivot-query query nil))
-
-  ([query :- ::qp.schema/any-query
-    rff   :- [:maybe ::qp.schema/rff]]
-   (log/debug "Running pivot query")
-   ;; Do not bind *card-id* here. Callers that run pivot queries for saved cards
-   ;; (e.g. card.clj, dashboards) bind *card-id* themselves before calling
-   ;; run-pivot-query, so binding it here from the query's :info map would be
-   ;; redundant and could mis-set it for ad-hoc queries that carry a :card-id in :info.
-   (qp.setup/with-qp-setup [query query]
-     (let [query       (-> query
+(mu/defn- run-pivot-query*
+  "Prepare and execute the existing multi-query pivot implementation inside the userland error boundary."
+  [query :- ::qp.schema/any-query
+   rff   :- ::qp.schema/rff]
+  (let [query       (-> query
                            qp.middleware.normalize/normalize-preprocessing-middleware ; normalize to MBQL 5 if needed.
                            lib/prepare-after-deserialization)
            rff         (or rff qp.reducible/default-rff)
@@ -532,4 +523,20 @@
                            add-canonical-col-info)
            all-queries (generate-queries query pivot-opts)]
        (binding [qp.pipeline/*pivot?* true]
-         (process-multiple-queries all-queries rff pivot-limit))))))
+         (process-multiple-queries all-queries rff pivot-limit))))
+
+(mu/defn run-pivot-query
+  "Run the pivot query. Queries with :info use the same exception boundary as other userland queries.
+  Wrap this call in [[metabase.query-processor.streaming/streaming-response]] yourself."
+  ([query]
+   (run-pivot-query query nil))
+  ([query :- ::qp.schema/any-query
+    rff   :- [:maybe ::qp.schema/rff]]
+   (log/debug "Running pivot query")
+   ;; Saved-card callers bind *card-id* themselves; do not derive it from an ad-hoc :info map.
+   (qp.setup/with-qp-setup [query query]
+     (let [query (cond-> query
+                   (seq (:info query)) qp/userland-query)
+           rff   (or rff qp.reducible/default-rff)
+           qp    (qp.catch-exceptions/catch-exceptions run-pivot-query*)]
+       (qp query rff)))))
