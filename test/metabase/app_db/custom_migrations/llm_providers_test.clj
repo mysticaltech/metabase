@@ -4,7 +4,10 @@
   `MigrateLlmProviderSettings` custom change."
   (:require
    [clojure.test :refer [deftest is testing]]
+   [metabase.app-db.db :as mdb.db]
+   [metabase.app-db.encryption :as mdb.encryption]
    [metabase.app-db.schema-migrations-test.impl :as impl]
+   [metabase.app-db.setting :as mdb.setting]
    [metabase.util.encryption :as encryption]
    [metabase.util.encryption-test :as encryption-test]
    [metabase.util.json :as json]
@@ -167,7 +170,7 @@
         (is (= {} (llm-setting-values ["llm-metabot-provider"])))))))
 
 (deftest rollback-llm-provider-settings-encrypts-only-secrets-test
-  (testing "v64.7qmx3p : the downgrade encrypts what the pre-migration code stored encrypted, and nothing else"
+  (testing "v64.7qmx3p : the legacy value column encrypts only settings the pre-migration code stored encrypted"
     (encryption-test/with-secret-key "dont-tell-anyone-about-this"
       (impl/test-migrations ["v64.7qmx3p"] [migrate!]
         (insert-llm-settings! {"llm-anthropic-api-key"      "sk-ant-stored"
@@ -216,3 +219,59 @@
       (is (= {} (llm-setting-values ["llm-anthropic-api-key" "llm-anthropic-api-base-url"])))
       (testing "and the list is dropped either way"
         (is (= {} (llm-setting-values ["llm-providers"])))))))
+
+(deftest rollback-llm-provider-settings-keeps-aad-encrypted-for-strict-startup-test
+  (testing "rollback preserves the legacy values without leaving plaintext for strict startup to repair"
+    (encryption-test/with-secret-key "rollback-regression-only-not-a-real-key"
+      (impl/test-migrations ["v64.7qmx3p"] [migrate!]
+        (let [expected {"llm-openai-api-key"      "synthetic-openai-key"
+                        "llm-openai-api-base-url" "https://openai.example.invalid"
+                        "llm-metabot-provider"    "openai/gpt-6.1-sol"}]
+          (insert-llm-settings! expected)
+          (migrate!)
+          (migrate! :down 63)
+          (let [rows (t2/query {:select [:key :value :value_with_aad]
+                               :from [:setting]
+                               :where [:in :key (keys expected)]})
+                by-key (into {} (map (juxt :key identity)) rows)]
+            (is (= (set (keys expected)) (set (keys by-key))))
+            (testing "the legacy non-sensitive contract and exact requested model remain unchanged"
+              (is (= "https://openai.example.invalid" (get-in by-key ["llm-openai-api-base-url" :value])))
+              (is (= "openai/gpt-6.1-sol" (get-in by-key ["llm-metabot-provider" :value])))
+              (is (not= "synthetic-openai-key" (get-in by-key ["llm-openai-api-key" :value]))))
+            (doseq [{:keys [key value_with_aad]} rows]
+              (let [aad {:aad (mdb.setting/setting-aad key)}
+                    encrypted? (encryption/decryptable-string? value_with_aad aad)]
+                (is encrypted? (str key " must not require implicit startup encryption"))
+                (is (not= (expected key) value_with_aad))
+                (is (when encrypted? (= (expected key) (encryption/maybe-decrypt value_with_aad aad))))
+                (is (not (encryption/decryptable-string? value_with_aad
+                            {:aad (mdb.setting/setting-aad "different-setting-row")})))))
+            (testing "the real strict startup detector accepts these actual migration-written rows"
+              (with-redefs [mdb.db/reducible-column-values (fn [& _] [])
+                            mdb.db/reducible-setting-values-with-aad (constantly rows)
+                            mdb.encryption/legacy-startup-encryption-disabled? (constantly true)]
+                (is (try (mdb.encryption/encrypt-plaintext-columns!) true
+                         (catch clojure.lang.ExceptionInfo _ false))))))
+          (migrate!)
+          (is (= [{:key "openai" :type "openai" :name "OpenAI"
+                   :config {:api-key "synthetic-openai-key" :base-url "https://openai.example.invalid"}}]
+                 (llm-connections)))
+          (is (= {"llm-metabot-provider" "openai/gpt-6.1-sol"}
+                 (llm-setting-values ["llm-metabot-provider"]))))))))
+
+(deftest rollback-llm-provider-settings-without-encryption-key-test
+  (testing "an explicitly unencrypted instance retains the existing no-key behavior"
+    (encryption-test/with-secret-key nil
+      (impl/test-migrations ["v64.7qmx3p"] [migrate!]
+        (insert-llm-settings! {"llm-openai-api-key" "synthetic-no-key-instance"
+                               "llm-metabot-provider" "openai/gpt-6.1-sol"})
+        (migrate!)
+        (migrate! :down 63)
+        (doseq [{:keys [key value value_with_aad]}
+                (t2/query {:select [:key :value :value_with_aad] :from [:setting]
+                           :where [:in :key ["llm-openai-api-key" "llm-metabot-provider"]]})]
+          (is (= value value_with_aad))
+          (is (= ({"llm-openai-api-key" "synthetic-no-key-instance"
+                    "llm-metabot-provider" "openai/gpt-6.1-sol"} key)
+                 value)))))))
