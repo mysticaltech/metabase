@@ -85,7 +85,7 @@
 
 (def ^:private sensitive-settings
   "The settings the pre-migration code stored encrypted (`:sensitive? true`). The downgrade writes them back the
-  same way, and leaves the rest plaintext to match their `:encryption :no` declarations."
+  same way in the legacy `value` column. The row-bound `value_with_aad` column is always encrypted when a key exists."
   #{"llm-anthropic-api-key" "llm-openai-api-key" "llm-openrouter-api-key" "llm-mistral-api-key"
     "llm-zai-api-key" "llm-moonshot-api-key" "llm-azure-api-key"
     "llm-google-service-account-key" "llm-google-oauth-access-token"
@@ -103,16 +103,16 @@
     (not-empty (str/trim value))))
 
 (defn- write-setting!
-  "Writes `value` for `setting-key`, in both `value` and `value_with_aad`, encrypted only when `encrypt?` — a setting
-  declared `:encryption :no` should not come out of a downgrade holding ciphertext, even though reads would decrypt it
-  opportunistically."
+  "Write the legacy column according to `encrypt?`, and always encrypt the row-bound column with its setting AAD.
+
+  `:encryption :no` controls the legacy column, not the at-rest contract of `value_with_aad`. Leaving that column
+  plaintext makes strict startup reject the rolled-back database; never require disabling that protection."
   [setting-key value encrypt?]
   (t2/query {:delete-from :setting :where [:= :key setting-key]})
   (t2/query {:insert-into :setting
              :values      [{:key            setting-key
                             :value          (cond-> value encrypt? encryption/maybe-encrypt)
-                            :value_with_aad (cond-> value
-                                              encrypt? (encryption/maybe-encrypt {:aad (mdb.setting/setting-aad setting-key)}))}]}))
+                            :value_with_aad (encryption/maybe-encrypt value {:aad (mdb.setting/setting-aad setting-key)})}]}))
 
 ;;; ------------------------------------------------------ Up ------------------------------------------------------
 
