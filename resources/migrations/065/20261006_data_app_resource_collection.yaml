@@ -10,6 +10,14 @@ databaseChangeLog:
       author: timofei
       comment: Index data apps by their resource collection (PostgreSQL)
       dbms: postgresql
+      # A newer patch retires this row while retaining the index. A patch backout
+      # must record it without attempting to create that same index again.
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - indexExists:
+                tableName: data_app
+                indexName: idx_data_app_resource_collection_id
       changes:
         - createIndex:
             tableName: data_app
